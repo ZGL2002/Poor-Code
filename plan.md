@@ -1,245 +1,312 @@
-# PoorCode Plan
+# 工具系统 Plan
 
 ## 架构概览
 
-整个应用分为五层，自上而下：
+当前五层架构中，工具系统作为一个新的横向层加入，位于 Chat Loop 编排层之下，与 Provider 层并列：
 
 ```
-┌─────────────────────────────────────────────┐
-│                  Chat Loop                   │  编排层：启动→对话循环→退出
-│              (poorcode/chat.py)              │
-├─────────────────────────────────────────────┤
-│                 TUI 渲染层                    │  界面层：Rich 渲染 + prompt_toolkit 输入
-│    (poorcode/tui/app.py, render.py,          │
-│           input_area.py)                     │
-├──────────────────┬──────────────────────────┤
-│   Config 模块     │     Provider 抽象层       │  业务层
-│ (poorcode/config  │  (poorcode/provider/     │
-│  .py)             │   base.py, registry.py)  │
-│                   ├──────────┬───────────────┤
-│                   │ Anthropic│   OpenAI      │
-│                   │ Provider │   Provider    │
-├──────────────────┴──────────┴───────────────┤
-│               HTTP + SSE 传输                 │  传输层：httpx 异步 HTTP + SSE 解析
-│         (poorcode/provider/http.py)          │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       Chat Loop                              │  编排层
+│                   (poorcode/chat.py)                         │  新增：工具调用检测→执行→结果注入
+├──────────────────────────┬──────────────────────────────────┤
+│       TUI 渲染层          │         Provider 抽象层           │
+│  (poorcode/tui/)         │    (poorcode/provider/)          │
+│  新增：show_tool_status   │   新增：工具格式转换、             │
+│                          │   流式 tool_use 解析              │
+├──────────────────────────┼──────────────────────────────────┤
+│                          │        工具系统（新增）             │
+│                          │    (poorcode/tools/)              │
+│                          │    base.py → 抽象接口              │
+│                          │    registry.py → 注册中心          │
+│                          │    security.py → 路径校验          │
+│                          │    read/write/edit/bash/glob/grep │
+├──────────────────────────┴──────────────────────────────────┤
+│                    HTTP + SSE 传输层                          │
+│               (poorcode/provider/http.py)                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**各层职责：**
+**各层职责变化：**
 
-- **Chat Loop 编排层**：应用生命周期的总调度。初始化配置→创建 Provider→启动 TUI→进入对话循环（读输入→调 Provider→流式渲染→追加历史→循环）。
-- **TUI 渲染层**：负责所有终端显示和用户输入。用 Rich 库渲染启动横幅、对话消息、Markdown 美化、状态栏；用 prompt_toolkit 实现底部输入框（支持 Alt+Enter 多行）。
-- **Provider 抽象层**：定义 LLMProvider 统一接口。通过注册表将配置中的 `protocol` 值映射到具体实现。新增后端只需注册一个子类。
-- **Provider 实现层**：AnthropicProvider 和 OpenAIProvider，各自负责消息格式转换、请求构造、SSE 事件解析。
-- **传输层**：封装 httpx 异步 HTTP 客户端，统一处理连接、超时、SSE 流读取。
+- **Chat Loop 编排层**：在流式循环中新增对 `tool_call` 事件的检测。收到工具调用后：暂停渲染 → 通知 TUI 展示状态 → 查 Registry 执行工具 → 结果构造成协议消息追加到 history → 再次调用 Provider 获取最终文本回复 → 停止（不循环）。
+- **Provider 抽象层**：`LLMProvider.__init__()` 新增可选 `tools` 参数。各子类负责将工具列表转为协议格式、解析流式 tool_use 事件为统一的 `ToolCallRequest`。
+- **TUI 渲染层**：新增 `show_tool_status(name, status)` 方法，在状态栏上方展示工具执行状态行。
+- **工具系统（新增）**：Tool 抽象基类、注册中心、六个工具实现、路径安全校验。
 
 ## 核心数据结构
 
-### Message
-标准化的对话消息，与协议无关。
+### ToolResult
+工具执行结果，不论成功失败都返回此结构。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| role | str | `"system"`、`"user"`、`"assistant"` |
-| content | str | 消息正文 |
+| success | bool | 执行是否成功 |
+| content | str | 成功时的返回数据，或失败时的错误描述 |
+| error | str \| None | 失败时的简短错误码（如 "timeout"、"not_found"），成功时为 None |
 
-### ProviderConfig
-从 YAML 解析出的配置对象。
+### ToolContext
+工具执行时的上下文信息，由 Chat Loop 注入。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| protocol | str | `"anthropic"` 或 `"openai"` |
-| model | str | 模型名，如 `"deepseek-v4-pro"` |
-| base_url | str | API 地址 |
-| api_key | str | 认证密钥 |
+| cwd | Path | 当前工作目录（用于路径解析和安全校验） |
+| timeout | float | 本工具的执行超时秒数 |
 
-### LLMProvider（抽象基类）
+### Tool（抽象基类）
 
-```
-class LLMProvider(ABC):
-    def __init__(self, config: ProviderConfig): ...
+```python
+class Tool(ABC):
+    name: str           # 工具名，如 "read"、"bash"
+    description: str    # 用途描述，供模型决策时参考
+    parameters: dict    # JSON Schema 格式的参数定义
 
     @abstractmethod
-    async def chat(
-        self,
-        messages: list[Message],
-        system_prompt: str | None = None,
-        stream: bool = True,
-    ) -> AsyncIterator[str]:
-        """发送消息，返回流式文本增量迭代器。"""
-        ...
+    async def execute(self, params: dict, context: ToolContext) -> ToolResult:
+        """执行工具，params 由模型填入，context 由 Chat Loop 注入."""
 ```
 
-- `messages`：历史对话列表
-- `system_prompt`：可选的系统提示，与 Anthropic 的 system 参数对应
-- `stream`：保留非流式路径但本次迭代仅用流式
-- 返回 `AsyncIterator[str]`，每次 yield 一段增量文本（通常是一个 token）
+- `parameters` 示例（Read 工具）：
+  ```python
+  {
+      "type": "object",
+      "properties": {
+          "file_path": {"type": "string", "description": "文件路径，相对于工作目录"}
+      },
+      "required": ["file_path"]
+  }
+  ```
 
-### StreamEvent
-流式响应中的统一事件结构，用于 TUI 渲染层判断内容类型。
+### ToolCallRequest
+Provider 解析完流式 tool_use 事件后产出的统一结构。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| type | str | `"text_delta"`、`"thinking_delta"`、`"done"` |
-| content | str | 增量文本内容 |
+| tool_name | str | 要调用的工具名 |
+| tool_input | dict | 模型填入的参数，键值对 |
+| tool_use_id | str | 协议层的调用 ID（Anthropic 需要，OpenAI 需要） |
 
-Provider 的 `chat()` 方法内部解析 SSE 事件流，对外产出 `StreamEvent`，TUI 层据此决定显示方式（thinking 内容可折叠或单独展示）。
+### StreamEvent 扩展
+现有 StreamEvent 新增两种 type 值：
+
+| type 值 | 含义 | content 字段 |
+|---------|------|-------------|
+| `"tool_call"` | 流式工具调用参数接收完毕 | ToolCallRequest 的 JSON 序列化字符串 |
+| `"tool_error"` | 工具调用解析失败（多工具等） | 错误描述文本 |
 
 ## 模块设计
 
-### 模块 A: Config (`poorcode/config.py`)
+### 模块 A: Tool 抽象基类 (`poorcode/tools/base.py`)
 
-**职责：** 读取、校验、生成 YAML 配置文件  
+**职责：** 定义 Tool 接口和工具系统核心数据结构  
 **对外接口：**
-- `load_config() -> ProviderConfig` — 读取 `~/.poorcode/config.yaml`，校验字段完整性，返回配置对象
-- `create_default_config(path: Path)` — 生成含占位值的默认配置文件
+- `ToolResult` — dataclass，字段 `success: bool`、`content: str`、`error: str | None`
+- `ToolContext` — dataclass，字段 `cwd: Path`、`timeout: float`
+- `Tool` — ABC，类属性 `name: str`、`description: str`、`parameters: dict`；抽象方法 `async execute(params: dict, context: ToolContext) -> ToolResult`
 
-**依赖：** 无外部模块依赖（仅 PyYAML）  
+**依赖：** 无  
 **对应需求：** F1
 
-### 模块 B: HTTP 传输 (`poorcode/provider/http.py`)
+### 模块 B: 工具注册中心 (`poorcode/tools/registry.py`)
 
-**职责：** 封装 httpx 异步 HTTP 客户端，统一处理 SSE 流读取  
+**职责：** 维护工具名到工具实例的映射，提供查找和协议格式转换  
 **对外接口：**
-- `async post_sse(url, headers, json_body) -> AsyncIterator[dict]` — 发送 POST 请求，逐行读取 SSE 事件，yield 解析后的 JSON dict
+- `register(tool: Tool) -> None` — 注册一个工具实例
+- `get(name: str) -> Tool | None` — 按名查找
+- `list_tools() -> list[Tool]` — 返回全部已注册工具
+- `to_anthropic_format() -> list[dict]` — 转为 Anthropic Messages API 的 `tools` 数组格式
+- `to_openai_format() -> list[dict]` — 转为 OpenAI Chat Completions 的 `tools` 数组格式
 
-**依赖：** httpx  
-**对应需求：** F3, F4（为两个 Provider 提供统一的 SSE 读取能力）
+**格式转换要点：**
+- Anthropic：`{"name": t.name, "description": t.description, "input_schema": t.parameters}`
+- OpenAI：`{"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}`
 
-### 模块 C: Provider 注册表 (`poorcode/provider/registry.py`)
+**依赖：** `poorcode/tools/base.py`  
+**对应需求：** F2
 
-**职责：** 维护 protocol 名到 Provider 类的映射，提供工厂方法  
+### 模块 C: 路径安全 (`poorcode/tools/security.py`)
+
+**职责：** 校验文件操作路径在工作目录范围内  
 **对外接口：**
-- `register_provider(protocol: str, provider_cls)` — 注册一个 Provider 实现
-- `create_provider(config: ProviderConfig) -> LLMProvider` — 根据配置创建对应的 Provider 实例
+- `validate_path(file_path: str, cwd: Path) -> Path` — 解析相对路径，检查不越界。成功返回绝对路径，越界抛出 `PathSecurityError`
+- `PathSecurityError` — 继承 `ValueError`，含中文错误描述
 
-**依赖：** `poorcode/provider/base.py`  
-**对应需求：** F2, N1
+**校验逻辑：** `Path(cwd / file_path).resolve()` 后检查是否以 `cwd.resolve()` 开头。`file_path` 为绝对路径时直接拒绝。
 
-### 模块 D: Anthropic Provider (`poorcode/provider/anthropic.py`)
+**依赖：** 无  
+**对应需求：** F7
 
-**职责：** 实现 Anthropic Messages API 调用  
-**对外接口：** 实现 `LLMProvider.chat()`
+### 模块 D: 六个核心工具
 
-**关键逻辑：**
-- 将 `list[Message]` 转换为 Anthropic Messages API 的 `messages` 数组格式
-- 将 `system_prompt` 放入 Anthropic 专用的 `system` 参数
-- 请求体中设置 `anthropic-beta: thinking-*` header 开启 extended thinking（如配置的模型支持）
-- 解析 SSE 事件流：`content_block_delta` → `text_delta` / `thinking_delta`；`message_stop` → `done`
+#### D1: Read (`poorcode/tools/read.py`)
+**对外接口：** `class ReadTool(Tool)`，name=`"read"`，parameters 含 `file_path: string`  
+**实现：** `validate_path()` → `Path.read_text()` → 返回文件内容和行数。文件不存在时返回 `success=False`  
+**默认超时：** 30 秒（继承默认）  
+**对应需求：** F3a
 
-**依赖：** `poorcode/provider/base.py`、`http.py`  
-**对应需求：** F3
+#### D2: Write (`poorcode/tools/write.py`)
+**对外接口：** `class WriteTool(Tool)`，name=`"write"`，parameters 含 `file_path: string`、`content: string`  
+**实现：** `validate_path()` → 父目录 `mkdir(parents=True)` → `Path.write_text()` → 返回路径和字节数  
+**默认超时：** 30 秒  
+**对应需求：** F3b
 
-### 模块 E: OpenAI Provider (`poorcode/provider/openai.py`)
+#### D3: Edit (`poorcode/tools/edit.py`)
+**对外接口：** `class EditTool(Tool)`，name=`"edit"`，parameters 含 `file_path: string`、`old_string: string`、`new_string: string`  
+**实现：** `validate_path()` → `Path.read_text()` → `str.count(old_string)` → 0 次返回 not_found，>1 次返回不唯一（含行号上下文），==1 次执行 `str.replace()` 并写回  
+**默认超时：** 30 秒  
+**对应需求：** F3c
 
-**职责：** 实现 OpenAI Chat Completions API 调用  
-**对外接口：** 实现 `LLMProvider.chat()`
+#### D4: Bash (`poorcode/tools/bash.py`)
+**对外接口：** `class BashTool(Tool)`，name=`"bash"`，parameters 含 `command: string`  
+**实现：** `asyncio.create_subprocess_shell()` → 等待完成（timeout 控制）→ 返回 stdout、stderr、exit_code  
+**路径限制：** 不做路径校验  
+**默认超时：** 120 秒（覆盖默认 30 秒）  
+**对应需求：** F3d
 
-**关键逻辑：**
-- 将 `list[Message]` 转换为 OpenAI 的 `messages` 数组（含 `system` 角色的消息）
-- SSE 事件解析：`choices[0].delta.content` → `text_delta`；`[DONE]` → `done`
+#### D5: Glob (`poorcode/tools/glob.py`)
+**对外接口：** `class GlobTool(Tool)`，name=`"glob"`，parameters 含 `pattern: string`  
+**实现：** `validate_path()` → `Path.glob(pattern)` → 返回匹配的相对路径列表  
+**默认超时：** 30 秒  
+**对应需求：** F3e
 
-**依赖：** `poorcode/provider/base.py`、`http.py`  
-**对应需求：** F4
+#### D6: Grep (`poorcode/tools/grep.py`)
+**对外接口：** `class GrepTool(Tool)`，name=`"grep"`，parameters 含 `pattern: string`、`path: string?`、`glob: string?`  
+**实现：** 在指定目录（默认 cwd）下递归搜索，用 glob 过滤文件名，逐行匹配 pattern（正则）。返回 `[{file, line_num, text}]` 列表  
+**默认超时：** 30 秒  
+**对应需求：** F3f
 
-### 模块 F: TUI 渲染 (`poorcode/tui/render.py`)
+### 模块 E: Provider 层变更
 
-**职责：** 用 Rich 库渲染所有终端输出  
+#### E1: `poorcode/provider/base.py`
+**变更：** 新增 `ToolCallRequest` 数据类；`StreamEvent` 注释新增 `tool_call` 和 `tool_error` type 值；`LLMProvider.__init__()` 新增可选参数 `tools: list[Tool] | None = None`，chat() 签名不变
+
+#### E2: `poorcode/provider/anthropic.py`
+**变更：**
+- `_build_body()` → 当 `self.tools` 非空时注入 `"tools"` 字段（调用 `registry.to_anthropic_format()`）
+- `chat()` → 新增 tool_use 流式解析状态机：收到 `content_block_start(type=tool_use)` 开始累积 → `content_block_delta(input_json_delta)` 拼接 JSON 字符串 → `content_block_stop` 时 parse 完整 JSON 产出 `StreamEvent(type="tool_call", content=ToolCallRequest.json())`
+- 检测到多个 tool_use content block 时，只解析第一个并产出 `tool_error` 事件
+- 工具执行后将结果构造成 Anthropic 的 `tool_result` content block，以 `role: user` 消息追加到历史
+
+#### E3: `poorcode/provider/openai.py`
+**变更：**
+- `_build_body()` → 当 `self.tools` 非空时注入 `"tools"` 字段（调用 `registry.to_openai_format()`）
+- `chat()` → 新增 tool_calls 流式解析：累积 `choices[0].delta.tool_calls` 碎片（按 index 分组）→ finishing 时产出 `StreamEvent(type="tool_call", ...)`
+- 检测到多个 tool_calls 时只执行第一个并产出错
+- 工具执行后将结果以 `role: tool` + `tool_call_id` 消息追加到历史
+
+### 模块 F: TUI 层变更 (`poorcode/tui/app.py`)
+
 **对外接口：**
-- `render_welcome(console, version, cwd)` — 渲染启动横幅（ASCII 猫 + 应用名版本 + 工作目录）、就绪提示、状态栏
-- `render_user_message(console, text)` — 渲染用户消息
-- `render_streaming(console, text_delta)` — 追加流式文本到当前输出区
-- `render_final(console, full_text)` — 流式结束后将整段用 Rich Markdown 重新渲染
-- `render_status_bar(console, provider_name, model_name)` — 刷新底部状态栏
+- `show_tool_status(name: str, status: str) -> None` — status 取值 `"running"`、`"done"`、`"error"`。在对话区渲染一行状态，更新为最终结果
+- 修改 `finish_streaming()` → 接受可选 `interrupted_by_tool: bool` 参数，为 True 时不渲染 Markdown（工具调用不是文本回复）
 
-**依赖：** rich  
-**对应需求：** F7, F8
+### 模块 G: Chat Loop 变更 (`poorcode/chat.py`)
 
-### 模块 G: TUI 输入 (`poorcode/tui/input_area.py`)
-
-**职责：** 用 prompt_toolkit 实现底部输入框  
-**对外接口：**
-- `create_input_area() -> PromptSession` — 创建并返回配置好的输入会话对象
-- `async get_input(session) -> str` — 异步获取用户输入，支持 Alt+Enter 多行、Enter 提交
-
-**依赖：** prompt_toolkit  
-**对应需求：** F9
-
-### 模块 H: TUI 应用 (`poorcode/tui/app.py`)
-
-**职责：** 组合渲染和输入，管理 TUI 生命周期  
-**对外接口：**
-- `class TuiApp` — 持有 Console、输入会话、Provider 信息
-- `tui.start()` — 显示欢迎界面
-- `tui.show_user_message(text)` — 显示用户输入
-- `tui.begin_streaming()` — 进入流式等待状态（禁用输入）
-- `tui.stream_delta(delta)` — 流式追加文本
-- `tui.finish_streaming(full_text)` — 流式结束，Markdown 渲染，恢复输入
-- `tui.show_error(message)` — 显示错误信息
-
-**依赖：** `render.py`、`input_area.py`  
-**对应需求：** F5, F7, F8, F9
-
-### 模块 I: Chat Loop (`poorcode/chat.py`)
-
-**职责：** 应用主循环，编排配置→Provider→TUI→对话  
-**对外接口：**
-- `async run()` — 应用入口：加载配置、创建 Provider、初始化 TUI、进入对话循环
-
-**流程：**
-1. `load_config()` → 校验
-2. `create_provider(config)` → 获取 Provider 实例
-3. `tui.start()` → 显示横幅和状态栏
-4. 循环：
-   - `tui.get_input()` → 读取用户输入
-   - 检查 `/quit`、`/exit`、空输入
-   - 追加 `Message(role="user", content=...)` 到历史
-   - `tui.begin_streaming()`
-   - `provider.chat(messages=history, stream=True)` → 异步迭代 StreamEvent
-   - 对每个 `text_delta`：`tui.stream_delta(delta.content)`
-   - 对每个 `thinking_delta`：视配置决定展示或隐藏
-   - 收到 `done`：`tui.finish_streaming(full_text)`
-   - 追加 `Message(role="assistant", content=full_text)` 到历史
-5. 捕获 `KeyboardInterrupt` → 安全退出
-
-**依赖：** `config.py`、`provider/`、`tui/`  
-**对应需求：** F5, F6
+**变更要点：**
+1. `run()` 中创建 Provider 后，将已注册工具列表传给 Provider 构造函数
+2. 流式循环中新增对 `tool_call` 和 `tool_error` 事件的处理：
+   - `tool_error` → `tui.show_error()` + 追加错误消息到 history，继续下一轮
+   - `tool_call` → 解析 `ToolCallRequest` → `tui.show_tool_status(name, "running")` → 从 Registry 查工具 → 创建 `ToolContext(cwd, timeout)` → `await tool.execute(params, context)` → `tui.show_tool_status(name, "done"/"error")` → 构造协议消息追加到 history → 第二次调用 `provider.chat()` 获取最终文本回复 → 流式展示 → 停止
+3. 最终文本回复后不再调用工具（即使模型返回了新的 tool_use，忽略/报错）
 
 ## 模块交互
 
-一次对话请求的完整调用链：
+### 一次工具调用的完整链路
 
 ```
-用户按 Enter 提交
+用户输入「读一下 README.md」
     │
     ▼
-chat.py (Chat Loop)
+chat.py: history.append(Message("user", "读一下 README.md"))
     │
-    ├─ tui.input_area.get_input()          ← 读取用户输入
-    ├─ tui.app.begin_streaming()           ← 通知 TUI 进入等待状态（禁用输入）
-    │
-    ├─ provider.chat(messages=history)     ← 调用 LLMProvider 接口（流式）
+    ├─ provider.chat(messages=history)         ← 发起流式请求（body 含 tools 列表）
     │       │
-    │       ├─ 消息格式转换（Message → API 格式）
-    │       ├─ http.post_sse(url, headers, body)  ← 发送 POST，SSE 流读取
-    │       │       │
-    │       │       └─ httpx.AsyncClient.stream()  ← 异步 HTTP 流
+    │       ├─ anthropic.py: _build_body()     ← 注入 "tools" 字段
+    │       ├─ http.post_sse()                 ← 发送 POST，SSE 流读取
     │       │
-    │       └─ SSE 事件解析 → yield StreamEvent     ← 协议层解析
+    │       └─ 流式解析：
+    │           content_block_start(type=tool_use) → 初始化累积状态
+    │           content_block_delta(input_json_delta) → 拼接 JSON 碎片
+    │           content_block_stop → parse 完整参数
+    │               │
+    │               └─ yield StreamEvent(type="tool_call", content="{...}")
     │
-    ├─ 对每个 StreamEvent:
-    │     ├─ text_delta      → tui.app.stream_delta(content)   ← 逐字追加
-    │     ├─ thinking_delta  → (缓存或展示)
-    │     └─ done            → tui.app.finish_streaming(full)  ← Markdown 重渲染
+    ├─ chat.py 收到 tool_call 事件：
+    │     │
+    │     ├─ 解析 ToolCallRequest(tool_name="read", tool_input={"file_path": "README.md"})
+    │     ├─ tui.show_tool_status("read", "running")    ← 终端显示 🔧 read … ⏳
+    │     ├─ tool = registry.get("read")
+    │     ├─ context = ToolContext(cwd=Path.cwd(), timeout=30)
+    │     ├─ result = await tool.execute({"file_path": "README.md"}, context)
+    │     │       │
+    │     │       ├─ security.validate_path("README.md", cwd)  ← 路径校验
+    │     │       └─ Path.read_text()                          ← 读文件
+    │     │
+    │     ├─ result = ToolResult(success=True, content="...文件内容...", error=None)
+    │     ├─ tui.show_tool_status("read", "done")      ← 终端显示 🔧 read … ✅
+    │     │
+    │     └─ 构造工具结果消息追加到 history：
+    │           Anthropic: Message(role="user", content=[{"type": "tool_result", ...}])
+    │           (由 Provider 的工具结果格式化方法完成)
     │
-    ├─ 追加 assistant Message 到 history
-    └─ tui.input_area.get_input()          ← 等待下一轮输入
+    ├─ provider.chat(messages=history)         ← 第二次调用，携带工具结果
+    │       │
+    │       └─ 模型看到文件内容，生成文本回复
+    │           yield StreamEvent(type="text_delta", ...)
+    │           yield StreamEvent(type="done")
+    │
+    └─ chat.py:
+          ├─ tui.stream_delta() / tui.finish_streaming()
+          ├─ history.append(Message("assistant", full_response))
+          └─ 停止，等待用户下一轮输入（不检查新 tool_use）
 ```
 
-**数据流方向：**
-- `config.yaml` → `ProviderConfig` → `LLMProvider.__init__()` （启动时，单向）
-- `list[Message]` ⇄ `chat()` / TUI （对话中，循环追加）
-- `StreamEvent` → TUI 渲染 （流式期间，单向推送）
+### 多工具调用被拒绝的流程
+
+```
+provider.chat() 解析到 2 个 tool_use content block
+    │
+    └─ 只解析第一个，产出:
+        1. StreamEvent(type="tool_call", content=ToolCallRequest{第1个工具})
+        2. StreamEvent(type="tool_error", content="模型请求了 2 个工具，本次仅支持 1 个。仅执行第 1 个。")
+
+chat.py:
+    ├─ 收到 tool_call → 正常执行第 1 个工具
+    └─ 收到 tool_error → tui.show_error("模型请求了多个工具...")
+```
+
+### 数据流方向
+
+```
+config.yaml ──→ ProviderConfig ──→ LLMProvider(..., tools=registry.list_tools())
+                                            │
+registry ──→ to_anthropic_format() ────────→ chat() body["tools"]
+registry ──→ to_openai_format() ────────────→ chat() body["tools"]
+                                            │
+chat() SSE response ──→ ToolCallRequest ──→ registry.get(name).execute()
+                                            │
+tool.execute() ──→ ToolResult ──→ history (protocol-formatted message)
+                                            │
+history ──→ provider.chat(messages=history) ──→ 最终文本回复 ──→ TUI
+```
+
+### 状态机：Provider 流式解析中的 tool_use 跟踪
+
+```
+初始状态: TEXT_MODE
+    │
+    ├─ content_block_start(type=text) → 保持 TEXT
+    ├─ content_block_start(type=tool_use) → 进入 TOOL_MODE
+    │       │
+    │       └─ 记录 tool_use_id, tool_name (从 content_block 中)
+    │
+    ├─ TOOL_MODE:
+    │     ├─ content_block_delta(input_json_delta) → 累积 JSON 片段
+    │     └─ content_block_stop → 解析累积的 JSON
+    │           ├─ 成功 → yield StreamEvent("tool_call", ...)
+    │           └─ 失败 → yield StreamEvent("tool_error", "JSON 解析失败")
+    │
+    └─ 检测到第 2 个 tool_use content block → 忽略 + yield StreamEvent("tool_error", ...)
+```
 
 ## 文件组织
 
@@ -247,59 +314,64 @@ chat.py (Chat Loop)
 Poor Code/
 ├── poorcode/
 │   ├── __init__.py
-│   ├── __main__.py              — 入口：python -m poorcode
-│   ├── chat.py                  — Chat Loop 编排
-│   ├── config.py                — 配置读取、校验、默认生成
+│   ├── __main__.py
+│   ├── chat.py                    — 修改：工具调用检测与执行编排
+│   ├── config.py
+│   ├── tools/                     — 新建包
+│   │   ├── __init__.py            — 导出 + 启动时自动注册全部六个工具
+│   │   ├── base.py                — Tool ABC、ToolResult、ToolContext
+│   │   ├── registry.py            — 注册中心 + 协议格式转换
+│   │   ├── security.py            — 路径安全校验
+│   │   ├── read.py                — Read 工具
+│   │   ├── write.py               — Write 工具
+│   │   ├── edit.py                — Edit 工具
+│   │   ├── bash.py                — Bash 工具
+│   │   ├── glob.py                — Glob 工具
+│   │   └── grep.py                — Grep 工具
 │   ├── provider/
-│   │   ├── __init__.py          — 导出 + 启动时注册所有 Provider
-│   │   ├── base.py              — LLMProvider 抽象基类、Message、StreamEvent
-│   │   ├── registry.py          — Provider 注册表 + create_provider 工厂
-│   │   ├── anthropic.py         — AnthropicProvider
-│   │   ├── openai.py            — OpenAIProvider
-│   │   └── http.py              — httpx SSE 请求封装
+│   │   ├── __init__.py
+│   │   ├── base.py                — 修改：新增 ToolCallRequest；LLMProvider.__init__ 加 tools 参数
+│   │   ├── registry.py
+│   │   ├── anthropic.py           — 修改：tool_use 流式解析 + 工具结果格式化
+│   │   ├── openai.py              — 修改：tool_calls 流式解析 + 工具结果格式化
+│   │   └── http.py
 │   └── tui/
 │       ├── __init__.py
-│       ├── app.py               — TuiApp 类，TUI 生命周期管理
-│       ├── render.py            — Rich 渲染（横幅、消息、Markdown、状态栏）
-│       └── input_area.py        — prompt_toolkit 输入框
-├── spec.md                       — [已完成] Spec
-├── plan.md                       — [当前] Plan
-├── task.md                       — [下一步] Tasks
-├── checklist.md                  — [下一步] Checklist
-├── pyproject.toml                — 项目元数据与依赖
+│       ├── app.py                 — 修改：新增 show_tool_status()
+│       ├── render.py              — 修改：新增 render_tool_status()
+│       └── input_area.py
+├── spec.md
+├── plan.md
+├── task.md
+├── checklist.md
+├── pyproject.toml
 └── README.md
 ```
-
-依赖声明 (`pyproject.toml`)：
-- `httpx` — 异步 HTTP + SSE 流
-- `rich` — Markdown 渲染与美化
-- `prompt_toolkit` — 输入框（Alt+Enter 多行）
-- `pyyaml` — YAML 配置解析
 
 ## 技术决策
 
 | 决策点 | 选择 | 理由 |
 |--------|------|------|
-| 异步框架 | `asyncio` + `httpx` | Python 内置异步能力，httpx 是唯一同时支持 HTTP/2 和 SSE 流式读取的主流客户端。不引入 aiohttp 等额外异步框架 |
-| SSE 解析 | 自行实现行级解析 | SSE 协议极其简单（`event:` + `data:` 行），百行以内即可完成，不必引入 sseclient 等第三方库 |
-| Provider 注册机制 | `dict` 映射 + 装饰器注册 | 每种协议一行 `register_provider("anthropic", AnthropicProvider)` 即可加入。新增后端只需写一个新文件 + 一行注册，满足 N1 可扩展性 |
-| extended thinking 处理 | 流式期间缓存，不回显；回复结束后可选折叠展示 | Anthropic 的 thinking delta 是内部推理，不应混入正式回复。缓存后可供调试，但不影响 Markdown 渲染 |
-| 消息模型 | 自建 `Message` 命名元组，含 `role` 和 `content` | 避免依赖任何 SDK 的数据模型。两种协议共用同一消息格式，在 Provider 内部各自转换 |
-| 配置位置 | `~/.poorcode/config.yaml` | 遵循 XDG 惯例，用户主目录下独立目录。与项目文件隔离，避免误提交密钥 |
-| 启动命令 | `python -m poorcode` | 标准 Python 包启动方式，无需安装脚本。后续可通过 pyproject.toml 的 scripts 字段注册为 `poorcode` 命令 |
-| 依赖版本策略 | 不锁定 patch 版本 | pyproject.toml 中声明 `>=` 约束，确保兼容性同时允许 bug 修复更新 |
-| 错误处理 | 分层处理，TUI 层统一展示 | HTTP 错误、SSE 解析错误、配置错误在各层捕获并转为中文提示，由 TuiApp.show_error() 统一渲染 |
+| 工具传递给 Provider 的方式 | `__init__(tools=...)` 而非 `chat(tools=...)` | 维持 `chat()` 签名不变（N3），工具集合在 Provider 生命周期内不变，放构造函数更合理 |
+| 流式工具调用解析策略 | Provider 内部累积 JSON 碎片，完整后一次性产出 `tool_call` 事件 | Chat Loop 不需要理解协议细节（F4 与 F5 解耦）。Provider 层做协议适配，Chat Loop 只看到统一的 `ToolCallRequest` |
+| Tool 参数定义格式 | 原生 dict（JSON Schema） | 无额外依赖，与两种协议的 `input_schema`/`parameters` 字段天然兼容。Provider 的 `to_*_format()` 直接透传 |
+| Edit 匹配策略 | `str.count()` + `str.replace()` | Python 标准库即可完成精确匹配，无需 difflib 或第三方 diff 库。先 count 再 replace 保证原子性 |
+| Bash 超时默认值 | 120 秒 | 编译、测试等常见命令可能耗时较长，30 秒不够。长超时配合 asyncio.wait_for 实现中断 |
+| 路径安全实现 | `Path.resolve()` 后前缀比较 | 正确处理 `..`、符号链接等越界手段。绝对路径直接拒绝，不尝试 normalize |
+| 工具结果截断 | 100KB 硬截，附加 `...(已截断)` 提示 | 防止大文件内容撑爆上下文窗口。100KB 约 25K token，足够模型理解但仍需设限 |
+| 多工具检测位置 | Provider 层检测 + Chat Loop 兜底 | 双重保障。Provider 在解析时计数 tool_use content block 数量，Chat Loop 在收到 tool_call 后检查是否有后续 tool_call（异常情况） |
+| Chat Loop 第二次 chat 后处理 | 忽略新的 tool_use，只取 text_delta | 不在本次实现 Agent Loop。如果模型在第二次回复中又请求工具，忽略并提示用户「模型尝试再次调用工具，当前版本不支持」 |
+| 工具注册时机 | `poorcode/tools/__init__.py` 导入时自动注册 | 与 Provider 注册机制一致（`poorcode/provider/__init__.py` 模式）。只要 import poorcode.tools 就完成注册 |
 
 ### spec 覆盖检查
 
 | F 需求 | 对应模块 |
 |--------|---------|
-| F1 配置文件管理 | Config (`config.py`) |
-| F2 Provider 抽象层 | Provider 基类 (`provider/base.py`) + 注册表 (`provider/registry.py`) |
-| F3 Anthropic 协议 | AnthropicProvider (`provider/anthropic.py`) + HTTP (`provider/http.py`) |
-| F4 OpenAI 协议 | OpenAIProvider (`provider/openai.py`) + HTTP (`provider/http.py`) |
-| F5 交互式对话界面 | Chat Loop (`chat.py`) + TuiApp (`tui/app.py`) |
-| F6 多轮上下文 | Chat Loop (`chat.py`) 维护 `list[Message]` |
-| F7 终端界面布局 | TUI 渲染 (`tui/render.py`) + 输入 (`tui/input_area.py`) |
-| F8 流式呈现与渲染 | TuiApp 流式方法 (`tui/app.py`) + Rich Markdown (`tui/render.py`) |
-| F9 输入与提交 | 输入框 (`tui/input_area.py`) |
+| F1 Tool 抽象接口 | `tools/base.py` |
+| F2 工具注册中心 | `tools/registry.py` |
+| F3 六个核心工具 | `tools/read.py` ~ `grep.py` |
+| F4 流式工具调用解析 | `provider/anthropic.py` + `provider/openai.py` |
+| F5 工具执行与结果回灌 | `chat.py` + Provider 结果格式化 |
+| F6 超时与错误处理 | `chat.py` 执行层 + 各工具 `execute()` |
+| F7 路径安全 | `tools/security.py` |
+| F8 TUI 工具状态展示 | `tui/app.py` + `tui/render.py` |

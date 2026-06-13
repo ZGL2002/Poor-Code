@@ -69,6 +69,39 @@ def render_status_bar(
     console.print(bar, style="reverse bold")
 
 
+def render_tool_status(
+    console: Console,
+    tool_name: str,
+    status: str,
+    detail: str = "",
+) -> None:
+    """渲染工具执行状态行.
+
+    Args:
+        console: Rich Console.
+        tool_name: 工具名（如 read、bash）.
+        status: "running"、 "done"、 "error".
+        detail: 失败时的错误码或简短说明.
+    """
+    if status == "running":
+        icon = "⏳"
+        text = f"🔧 {tool_name} … {icon} 执行中"
+        style = "bold yellow"
+    elif status == "done":
+        icon = "✅"
+        text = f"🔧 {tool_name} … {icon} 完成"
+        style = "bold green"
+    elif status == "error":
+        icon = "❌"
+        text = f"🔧 {tool_name} … {icon} {detail}".rstrip()
+        style = "bold red"
+    else:
+        text = f"🔧 {tool_name} … {status}"
+        style = "dim"
+
+    console.print(text, style=style)
+
+
 def render_error(console: Console, message: str) -> None:
     """以红色高亮显示错误信息."""
     console.print()

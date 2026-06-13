@@ -11,6 +11,7 @@ from poorcode.tui.render import (
     render_error,
     render_separator,
     render_status_bar,
+    render_tool_status,
     render_user_message,
     render_welcome,
 )
@@ -106,6 +107,21 @@ class TuiApp:
             self._live.stop()
             self._live = None
         render_error(self.console, message)
+
+    def show_tool_status(
+        self,
+        name: str,
+        status: str,
+        detail: str = "",
+    ) -> None:
+        """显示工具执行状态行.
+
+        Args:
+            name: 工具名.
+            status: "running"、"done"、"error".
+            detail: 失败时的错误码.
+        """
+        render_tool_status(self.console, name, status, detail)
 
     @property
     def is_streaming(self) -> bool:
