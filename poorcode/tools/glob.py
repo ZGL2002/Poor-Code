@@ -10,6 +10,7 @@ class GlobTool(Tool):
     """按 glob 模式匹配文件路径."""
 
     name = "glob"
+    category = "read"
     description = (
         "按 glob 模式查找匹配的文件路径。支持 ** 递归匹配。"
         "适合查找特定类型或命名模式的文件，如 '**/*.py' 找所有 Python 文件。"

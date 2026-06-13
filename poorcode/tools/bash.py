@@ -11,6 +11,7 @@ class BashTool(Tool):
     """在子进程中执行 Shell 命令."""
 
     name = "bash"
+    category = "write"
     description = (
         "执行 Shell 命令并返回 stdout、stderr 和退出码。"
         "适合编译、测试、文件操作等需要命令行的任务。"

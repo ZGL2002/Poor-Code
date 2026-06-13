@@ -8,9 +8,12 @@ from rich.text import Text
 
 from poorcode.tui.input_area import PromptSession, create_input_session, get_input
 from poorcode.tui.render import (
+    render_agent_done,
+    render_agent_progress,
     render_error,
     render_separator,
     render_status_bar,
+    render_token_usage,
     render_tool_status,
     render_user_message,
     render_welcome,
@@ -122,6 +125,43 @@ class TuiApp:
             detail: 失败时的错误码.
         """
         render_tool_status(self.console, name, status, detail)
+
+    def show_agent_progress(self, iteration: int, max_iterations: int) -> None:
+        """显示 Agent Loop 循环进度.
+
+        Args:
+            iteration: 当前轮次.
+            max_iterations: 最大轮次.
+        """
+        render_agent_progress(self.console, iteration, max_iterations)
+
+    def show_agent_done(
+        self,
+        reason: str,
+        total_iterations: int,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
+        """显示 Agent Loop 结束摘要.
+
+        Args:
+            reason: 停止原因.
+            total_iterations: 总迭代轮次.
+            input_tokens: 总输入 Token 数.
+            output_tokens: 总输出 Token 数.
+        """
+        render_agent_done(
+            self.console, reason, total_iterations, input_tokens, output_tokens
+        )
+
+    def show_token_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """显示 Token 用量.
+
+        Args:
+            input_tokens: 输入 Token 数.
+            output_tokens: 输出 Token 数.
+        """
+        render_token_usage(self.console, input_tokens, output_tokens)
 
     @property
     def is_streaming(self) -> bool:

@@ -2,6 +2,7 @@
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -23,7 +24,15 @@ protocol: anthropic       # 协议类型：anthropic 或 openai
 model: your-model-name    # 模型名称
 base_url: https://api.example.com  # API 地址
 api_key: ${POORCODE_API_KEY}     # API 密钥（支持 ${ENV_VAR} 语法）
+max_iterations: 25        # Agent Loop 最大迭代轮次
 """
+
+
+@dataclass
+class AppConfig:
+    """应用级配置，包含 Provider 配置和 Agent 参数."""
+    provider: ProviderConfig
+    max_iterations: int = 25
 
 
 def _resolve_env_vars(value: str) -> str:
@@ -56,8 +65,8 @@ def create_default_config(path: Path) -> None:
     path.write_text(DEFAULT_CONFIG, encoding="utf-8")
 
 
-def load_config(path: Path | None = None) -> ProviderConfig:
-    """读取并校验配置文件，返回 ProviderConfig.
+def load_config(path: Path | None = None) -> AppConfig:
+    """读取并校验配置文件，返回 AppConfig.
 
     查找顺序：指定路径 > 当前目录 config.yaml > ~/.poorcode/config.yaml。
     支持 ${ENV_VAR} 语法引用环境变量。
@@ -97,9 +106,13 @@ def load_config(path: Path | None = None) -> ProviderConfig:
         print(f"❌ 不支持的协议类型：{protocol}，仅支持 anthropic 或 openai")
         raise SystemExit(1)
 
-    return ProviderConfig(
+    provider_config = ProviderConfig(
         protocol=protocol,
         model=_resolve_env_vars(str(data["model"]).strip()),
         base_url=_resolve_env_vars(str(data["base_url"]).strip().rstrip("/")),
         api_key=_resolve_env_vars(str(data["api_key"]).strip()),
     )
+
+    max_iterations = int(data.get("max_iterations", 25))
+
+    return AppConfig(provider=provider_config, max_iterations=max_iterations)

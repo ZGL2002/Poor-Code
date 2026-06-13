@@ -1,295 +1,271 @@
-# 工具系统 Tasks
+# Agent Loop Tasks
 
 ## 文件清单
 
 | 操作 | 文件 | 职责 |
 |------|------|------|
-| 新建 | `poorcode/tools/__init__.py` | 导出 + 启动时自动注册全部六个工具 |
-| 新建 | `poorcode/tools/base.py` | Tool ABC、ToolResult、ToolContext |
-| 新建 | `poorcode/tools/registry.py` | 注册中心 + 协议格式转换 |
-| 新建 | `poorcode/tools/security.py` | 路径安全校验 |
-| 新建 | `poorcode/tools/read.py` | Read 工具 |
-| 新建 | `poorcode/tools/write.py` | Write 工具 |
-| 新建 | `poorcode/tools/edit.py` | Edit 工具 |
-| 新建 | `poorcode/tools/bash.py` | Bash 工具 |
-| 新建 | `poorcode/tools/glob.py` | Glob 工具 |
-| 新建 | `poorcode/tools/grep.py` | Grep 工具 |
-| 修改 | `poorcode/provider/base.py` | 新增 ToolCallRequest；LLMProvider 加 tools 参数 |
-| 修改 | `poorcode/provider/anthropic.py` | tool_use 流式解析 + 工具结果格式化 |
-| 修改 | `poorcode/provider/openai.py` | tool_calls 流式解析 + 工具结果格式化 |
-| 修改 | `poorcode/tui/render.py` | 新增 render_tool_status() |
-| 修改 | `poorcode/tui/app.py` | 新增 show_tool_status()；finish_streaming 适配工具调用 |
-| 修改 | `poorcode/chat.py` | 工具调用检测与执行编排 |
+| 修改 | `poorcode/tools/base.py` | Tool 基类新增 `category` 属性 |
+| 修改 | `poorcode/tools/read.py` | category = "read" |
+| 修改 | `poorcode/tools/glob.py` | category = "read" |
+| 修改 | `poorcode/tools/grep.py` | category = "read" |
+| 修改 | `poorcode/tools/write.py` | category = "write" |
+| 修改 | `poorcode/tools/edit.py` | category = "write" |
+| 修改 | `poorcode/tools/bash.py` | category = "write" |
+| 新建 | `poorcode/agent/__init__.py` | 导出 AgentLoop、AgentEvent、ToolExecutor |
+| 新建 | `poorcode/agent/events.py` | AgentEvent 类型定义 |
+| 新建 | `poorcode/agent/collector.py` | StreamingCollector |
+| 新建 | `poorcode/agent/executor.py` | ToolExecutor（分类 + 并发/串行） |
+| 新建 | `poorcode/agent/stop.py` | StopChecker |
+| 新建 | `poorcode/agent/loop.py` | AgentLoop 主循环 |
+| 修改 | `poorcode/config.py` | 新增 `max_iterations` 配置项 |
+| 修改 | `config.yaml` | 新增 `max_iterations: 25` |
+| 修改 | `poorcode/tui/app.py` | 新增消费 AgentEvent 的方法 |
+| 修改 | `poorcode/tui/render.py` | 新增 progress 和 done 渲染 |
+| 修改 | `poorcode/chat.py` | 重写为薄编排层 + Plan Mode |
 
-## T1: Tool 抽象基类与数据结构
+## T1: Tool 基类增加 category 属性
 
-**文件：** `poorcode/tools/base.py`
+**文件：** `poorcode/tools/base.py`、`poorcode/tools/read.py`、`poorcode/tools/glob.py`、`poorcode/tools/grep.py`、`poorcode/tools/write.py`、`poorcode/tools/edit.py`、`poorcode/tools/bash.py`
+
 **依赖：** 无
+
 **步骤：**
-1. 定义 `ToolResult` 数据类（`success: bool`、`content: str`、`error: str | None`）
-2. 定义 `ToolContext` 数据类（`cwd: Path`、`timeout: float`）
-3. 定义 `Tool` 抽象基类，含类属性 `name: str`、`description: str`、`parameters: dict`
-4. 声明抽象方法 `async execute(self, params: dict, context: ToolContext) -> ToolResult`
-5. 添加 RESULT_MAX_SIZE = 100 * 1024 常量（100KB 截断阈值）
+1. 在 `poorcode/tools/base.py` 的 `Tool` 基类中添加类属性 `category: str = "read"`
+2. 在 `ReadTool`、`GlobTool`、`GrepTool` 中确认或添加 `category = "read"`
+3. 在 `WriteTool`、`EditTool`、`BashTool` 中添加 `category = "write"`
 
-**验证：** `python -c "from poorcode.tools.base import Tool, ToolResult, ToolContext"` 无报错
+**验证：** `python -c "from poorcode.tools import list_tools; print({t.name: t.category for t in list_tools()})"` 输出 `{'read': 'read', 'write': 'write', 'edit': 'write', 'bash': 'write', 'glob': 'read', 'grep': 'read'}`
 
-## T2: 路径安全校验
+## T2: AgentEvent 类型定义
 
-**文件：** `poorcode/tools/security.py`
+**文件：** `poorcode/agent/events.py`（新建）
+
 **依赖：** 无
+
 **步骤：**
-1. 定义 `PathSecurityError`，继承 `ValueError`
-2. 实现 `validate_path(file_path: str, cwd: Path) -> Path`：
-   - `file_path` 为绝对路径时抛出 `PathSecurityError("不允许绝对路径：{file_path}")`
-   - `Path(cwd / file_path).resolve()` 获取绝对路径
-   - 检查是否以 `cwd.resolve()` 开头，不是则抛出 `PathSecurityError("路径越界：...")`
-   - 通过则返回解析后的 `Path`
+1. 定义 `TextDeltaEvent` dataclass —— 字段 `content: str`
+2. 定义 `ThinkingDeltaEvent` dataclass —— 字段 `content: str`
+3. 定义 `ToolCallEvent` dataclass —— 字段 `tool_name: str`、`tool_input: dict`、`tool_use_id: str`
+4. 定义 `ToolResultEvent` dataclass —— 字段 `tool_name: str`、`tool_use_id: str`、`success: bool`、`error: str | None`、`content_preview: str`
+5. 定义 `TokenUsageEvent` dataclass —— 字段 `input_tokens: int`、`output_tokens: int`
+6. 定义 `AgentProgressEvent` dataclass —— 字段 `iteration: int`、`max_iterations: int`
+7. 定义 `AgentDoneEvent` dataclass —— 字段 `reason: str`、`total_iterations: int`、`total_input_tokens: int`、`total_output_tokens: int`
+8. 定义 `ErrorEvent` dataclass —— 字段 `message: str`、`recoverable: bool`
+9. 定义联合类型 `AgentEvent = TextDeltaEvent | ThinkingDeltaEvent | ToolCallEvent | ToolResultEvent | TokenUsageEvent | AgentProgressEvent | AgentDoneEvent | ErrorEvent`
 
-**验证：** 临时脚本测试：`validate_path("foo.txt", cwd)` 正常返回；`validate_path("/etc/passwd", cwd)` 抛异常；`validate_path("../outside", cwd)` 抛异常
+**验证：** `python -c "from poorcode.agent.events import AgentProgressEvent, AgentDoneEvent; e = AgentProgressEvent(iteration=1, max_iterations=25); print(e.iteration)"` 无报错，输出 `1`
 
-## T3: 工具注册中心
+## T3: 流式收集器
 
-**文件：** `poorcode/tools/registry.py`
-**依赖：** T1
+**文件：** `poorcode/agent/collector.py`（新建）
+
+**依赖：** T2、`poorcode.provider.base.StreamEvent`、`poorcode.provider.base.ToolCallRequest`
+
 **步骤：**
-1. 维护模块级 `_registry: dict[str, Tool]` 字典
-2. 实现 `register(tool: Tool)`——按 `tool.name` 注册
-3. 实现 `get(name: str) -> Tool | None`
-4. 实现 `list_tools() -> list[Tool]`——返回全部已注册工具
-5. 实现 `to_anthropic_format() -> list[dict]`——每条 `{"name": t.name, "description": t.description, "input_schema": t.parameters}`
-6. 实现 `to_openai_format() -> list[dict]`——每条 `{"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}`
+1. 实现 `StreamingCollector` 类
+2. 构造函数初始化：`_full_text = ""`、`_tool_calls: list[ToolCallRequest] = []`、`_tool_use_count = 0`
+3. 实现 `async collect(stream: AsyncIterator[StreamEvent]) -> AsyncIterator[AgentEvent]`：
+   - 遍历 `stream` 中的每个 `StreamEvent`
+   - `text_delta` → 拼接 `_full_text`，同步 `yield TextDeltaEvent(content=...)`
+   - `thinking_delta` → `yield ThinkingDeltaEvent(content=...)`
+   - `tool_call` → 解析 JSON 得到 `ToolCallRequest`，追加到 `_tool_calls`，`yield ToolCallEvent(...)`
+   - `tool_error` → `yield ErrorEvent(message=..., recoverable=True)`
+   - `done` → 直接结束循环（不 yield）
+4. 暴露只读属性 `full_text: str` 和 `tool_calls: list[ToolCallRequest]`
 
-**验证：** 创建 MockTool 注册后，`get("mock")` 能找到，`list_tools()` 含它，`to_anthropic_format()` / `to_openai_format()` 输出格式正确
+**验证：** `python -c "from poorcode.agent.collector import StreamingCollector; c = StreamingCollector(); print(c.full_text, c.tool_calls)"` 无报错，输出空字符串和空列表
 
-## T4: Read 工具
+## T4: 停止条件检查器
 
-**文件：** `poorcode/tools/read.py`
-**依赖：** T1, T2
+**文件：** `poorcode/agent/stop.py`（新建）
+
+**依赖：** 无
+
 **步骤：**
-1. 实现 `ReadTool(Tool)`，name=`"read"`，description 说明用途，parameters 定义 `file_path` 参数
-2. `execute()` 中调用 `validate_path()` → `Path.read_text()` → 返回文件内容和行数
-3. 超过 100KB 时截断并附加 `\n...(内容已截断，超过 100KB)`
-4. `FileNotFoundError` 时返回 `ToolResult(success=False, error="not_found", content="文件不存在：{path}")`
-5. `PermissionError` 时返回 `ToolResult(success=False, error="permission", content="...")`
+1. 实现 `StopChecker` 类
+2. 构造函数接收 `max_iterations: int`，初始化 `_consecutive_unknown: int = 0`
+3. 实现 `check(iteration: int, tool_calls: list, stream_error: str | None = None) -> str | None`：
+   - 若 `stream_error` → 返回 `"stream_error"`
+   - 若 `iteration > max_iterations` → 返回 `"max_iterations"`
+   - 若 `tool_calls` 为空（模型不再要工具）→ 返回 `"natural_stop"`（正常停止信号）
+   - 否则返回 `None`（继续循环）
+4. 实现 `register_tool_result(tool_name: str, tool_exists: bool)`：
+   - 若 `not tool_exists`：`_consecutive_unknown += 1`
+   - 若 `tool_exists`：`_consecutive_unknown = 0`
+5. 实现 `check_consecutive_unknown() -> str | None`：
+   - 若 `_consecutive_unknown >= 3` → 返回 `"consecutive_unknown_tools"`
+   - 否则返回 `None`
+6. 实现 `reset()` → 重置 `_consecutive_unknown = 0`
 
-**验证：** 临时脚本：读存在的文件 → `success=True`；读不存在的文件 → `success=False` + error="not_found"
+**验证：** 临时脚本：创建 StopChecker(25)，iteration=3, tool_calls 非空 → check() 返回 None；iteration=26 → 返回 "max_iterations"
 
-## T5: Write 工具
+## T5: 工具执行器
 
-**文件：** `poorcode/tools/write.py`
-**依赖：** T1, T2
+**文件：** `poorcode/agent/executor.py`（新建）
+
+**依赖：** T1、T2、`poorcode.tools.base`、`poorcode.provider.base.ToolCallRequest`
+
 **步骤：**
-1. 实现 `WriteTool(Tool)`，name=`"write"`，parameters 含 `file_path` 和 `content`
-2. `execute()` 中调用 `validate_path()` → `parent.mkdir(parents=True, exist_ok=True)` → `Path.write_text()`
-3. 返回 `ToolResult(success=True, content="已写入：{path}，{bytes} 字节")`
-4. 异常时返回 `success=False`
+1. 实现 `classify(calls: list[ToolCallRequest], tools: dict[str, Tool]) -> tuple[list, list]`：
+   - 遍历 calls，查 tools 获取 tool 实例
+   - `tool.category == "read"` → 放入读类列表
+   - 否则 → 放入写类列表
+   - 工具未注册 → 放入写类列表（保守处理，含错误结果）
+2. 实现 `async execute_all(calls: list[ToolCallRequest], tools: dict[str, Tool], cwd: Path) -> AsyncIterator[AgentEvent]`：
+   - 调用 `classify()` 分类
+   - 读类并发：`await asyncio.gather(*[execute_one(call, tools, cwd) for call in read_calls])`
+   - 写类串行：`for call in write_calls: await execute_one(call, tools, cwd)`
+   - 每完成一个工具就 `yield ToolResultEvent(...)`
+   - 返回结果保持原始 `calls` 顺序
+3. 实现 `async execute_one(call, tools, cwd) -> tuple[ToolCallRequest, ToolResult]`：
+   - 查工具，构造 `ToolContext(cwd=Path(cwd), timeout=...)`
+   - 执行，捕获异常
+   - 返回 `(call, result)` 配对
 
-**验证：** 临时脚本写入文件 → 检查文件存在且内容正确
+**验证：** `python -c "from poorcode.agent.executor import ToolExecutor; e = ToolExecutor(); print('ok')"` 无报错
 
-## T6: Edit 工具
+## T6: Agent Loop 主循环
 
-**文件：** `poorcode/tools/edit.py`
-**依赖：** T1, T2
+**文件：** `poorcode/agent/loop.py`（新建）
+
+**依赖：** T2、T3、T4、T5、Provider、工具注册表
+
 **步骤：**
-1. 实现 `EditTool(Tool)`，name=`"edit"`，parameters 含 `file_path`、`old_string`、`new_string`
-2. `execute()` 逻辑：
-   - `validate_path()` → `Path.read_text()`
-   - `count = content.count(old_string)`
-   - `count == 0` → 返回 `success=False, error="not_found", content="未找到原文，请确认字符串内容与文件一致"`
-   - `count > 1` → 返回 `success=False, error="not_unique", content="匹配到 N 处，原文不唯一：\n（列出每处的行号与上下文）"`
-   - `count == 1` → `content.replace(old_string, new_string)` → `Path.write_text()` → 返回 `success=True, content="已替换 1 处"`
-3. 替换成功后返回文件路径和替换位置简要信息
+1. 实现 `AgentLoop` 类
+2. 构造函数接收：
+   - `provider: LLMProvider`
+   - `tools: list[Tool]`（当前模式下的工具列表）
+   - `max_iterations: int = 25`
+   - `cancel_flag: asyncio.Event | None = None`（Esc 取消）
+3. 实现 `async run(history: list[Message], system_prompt: str | None = None) -> AsyncIterator[AgentEvent]`：
+   - 初始化 `StopChecker(max_iterations)`、`iteration = 0`、`total_input_tokens = 0`、`total_output_tokens = 0`
+   - **循环**：
+     - `iteration += 1`
+     - yield `AgentProgressEvent(iteration, max_iterations)`
+     - 检查 `cancel_flag.is_set()` → yield `AgentDoneEvent(reason="user_cancel", ...)` → 退出
+     - 调用 `provider.chat(messages=history, stream=True)` 获取 SSE 流
+     - 创建 `StreamingCollector`，`async for event in collector.collect(stream): yield event`
+     - 若 collector 产出过 `ErrorEvent` 且不可恢复 → yield `AgentDoneEvent(reason="stream_error", ...)` → 退出
+     - 从 provider 响应中提取 token 用量（如有），yield `TokenUsageEvent(...)`
+     - 调用 `stop_checker.check(iteration, collector.tool_calls)`
+       - 返回 `"natural_stop"` → yield `AgentDoneEvent(reason="natural_stop", ...)` → 退出
+       - 返回 `"max_iterations"` → yield `AgentDoneEvent(reason="max_iterations", ...)` → 退出
+       - 返回其他原因 → yield `AgentDoneEvent(reason=..., ...)` → 退出
+     - 若 collector 有 tool_calls：
+       - `async for event in ToolExecutor.execute_all(collector.tool_calls, self._tools_map, cwd): yield event`
+       - 检查连续未知工具（`stop_checker.check_consecutive_unknown()`）
+       - 将工具结果回灌 history（调用 `_append_tool_messages`）
+       - 继续循环
+     - 若 collector 无 tool_calls → 追加 assistant 消息到 history → yield `AgentDoneEvent(reason="natural_stop", ...)` → 退出
+4. 实现 `_build_tools_map() -> dict[str, Tool]`：将 tools 列表转为 `{name: tool}` 字典
+5. 实现 `_append_tool_messages(history, call, result)`：按协议格式追加（复用现有 chat.py 中的 `_append_tool_messages` 逻辑）
 
-**验证：** 临时脚本：唯一匹配替换成功；不匹配返回 not_found；多处匹配返回 not_unique
+**验证：** `python -c "from poorcode.agent.loop import AgentLoop; print('ok')"` 无报错
 
-## T7: Bash 工具
+## T7: Agent 包初始化
 
-**文件：** `poorcode/tools/bash.py`
-**依赖：** T1
+**文件：** `poorcode/agent/__init__.py`（新建）
+
+**依赖：** T6
+
 **步骤：**
-1. 实现 `BashTool(Tool)`，name=`"bash"`，parameters 含 `command`，覆盖默认超时 120 秒
-2. `execute()` 逻辑：
-   - `asyncio.wait_for(asyncio.create_subprocess_shell(cmd, stdout=PIPE, stderr=PIPE), timeout=context.timeout)`
-   - 等待进程完成，收集 stdout、stderr、exit_code
-   - 返回 `success=True`（exit_code==0）或 `success=False`（exit_code!=0），content 含 stdout + stderr
-3. `asyncio.TimeoutError` → 杀进程，返回 `success=False, error="timeout"`
-4. 不调用 `validate_path()`（Bash 无路径限制）
+1. 导入并导出 `AgentLoop`、`StreamingCollector`、`ToolExecutor`、`StopChecker`
+2. 导入并导出所有 `AgentEvent` 类型
 
-**验证：** 临时脚本：`command="echo hello"` → success=True，stdout="hello\n"；`command="sleep 5"` + timeout=1 → success=False, error="timeout"
+**验证：** `python -c "from poorcode.agent import AgentLoop, AgentProgressEvent, AgentDoneEvent"` 无报错
 
-## T8: Glob 工具
+## T8: 配置新增 max_iterations
 
-**文件：** `poorcode/tools/glob.py`
-**依赖：** T1, T2
+**文件：** `poorcode/config.py`、`config.yaml`
+
+**依赖：** 无
+
 **步骤：**
-1. 实现 `GlobTool(Tool)`，name=`"glob"`，parameters 含 `pattern`
-2. `execute()` 逻辑：
-   - `validate_path(".", cwd)` 确认基准目录可访问（pattern 本身不校验越界，由 glob 结果各自校验）
-   - `Path.glob(pattern)` 收集匹配结果
-   - 结果使用相对路径展示
-   - 无匹配时返回 `content="未找到匹配的文件"`
-3. 结果过多时截断到 200 条，附加提示
+1. 在 `config.yaml` 中添加 `max_iterations: 25`
+2. 在 `poorcode/config.py` 的 `Config` 数据类中添加 `max_iterations: int = 25`
+3. 确认 YAML 解析时正确读入该字段
 
-**验证：** 临时脚本：`pattern="**/*.py"` → 返回 .py 文件列表
+**验证：** `python -c "from poorcode.config import load_config; c = load_config(); print(c.max_iterations)"` 输出 `25`
 
-## T9: Grep 工具
+## T9: TUI 适配 AgentEvent
 
-**文件：** `poorcode/tools/grep.py`
-**依赖：** T1, T2
+**文件：** `poorcode/tui/app.py`、`poorcode/tui/render.py`
+
+**依赖：** T2
+
 **步骤：**
-1. 实现 `GrepTool(Tool)`，name=`"grep"`，parameters 含 `pattern`（必填）、`path`（可选）、`glob`（可选）
-2. `execute()` 逻辑：
-   - 确定搜索目录：`path` 存在则 `validate_path(path)`，否则用 cwd
-   - 若 `glob` 存在，先用 `Path.rglob(glob)` 筛选文件
-   - 否则递归遍历所有文本文件（跳过二进制和隐藏目录 `.git` 等）
-   - 逐行用 `re.search(pattern, line)` 匹配
-   - 返回 `[{file, line_num, text}]` 格式
-3. 结果过多时截断到 500 行，附加提示
-4. 编译正则异常时返回 `success=False`
+1. 在 `render.py` 中新增 `render_agent_progress(console, iteration, max_iterations)` —— 显示「🔄 第 3/25 轮」
+2. 在 `render.py` 中新增 `render_agent_done(console, reason, total_iterations, tokens)` —— 显示停止原因摘要（如「✅ 完成（3 轮，1,234 tokens）」）
+3. 在 `render.py` 中新增 `render_token_usage(console, input_tokens, output_tokens)` —— 显示单次调用的 Token 用量
+4. 在 `app.py` 中新增 `show_agent_progress(iteration, max_iterations)` → 调用 `render_agent_progress`
+5. 在 `app.py` 中新增 `show_agent_done(reason, total_iterations, input_tokens, output_tokens)` → 调用 `render_agent_done`
+6. 在 `app.py` 中新增 `show_token_usage(input_tokens, output_tokens)` → 调用 `render_token_usage`
+7. 保留现有的 `show_tool_status`、`stream_delta`、`finish_streaming` 等方法不变
 
-**验证：** 临时脚本：`pattern="import"` → 返回所有含 import 的文件和行
+**验证：** `python -c "from poorcode.tui.app import TuiApp; from poorcode.tui.render import render_agent_progress, render_agent_done; print('ok')"` 无报错
 
-## T10: 工具包初始化与自动注册
-
-**文件：** `poorcode/tools/__init__.py`
-**依赖：** T3, T4, T5, T6, T7, T8, T9
-**步骤：**
-1. 导入所有工具类和注册中心函数
-2. 模块加载时调用 `register(ReadTool())` 等六行完成注册
-3. 导出 `Tool`、`ToolResult`、`ToolContext`、`register`、`get`、`list_tools`、`to_anthropic_format`、`to_openai_format`
-
-**验证：** `python -c "from poorcode.tools import list_tools; print([t.name for t in list_tools()])"` 输出 `['read', 'write', 'edit', 'bash', 'glob', 'grep']`
-
-## T11: Provider 基类变更
-
-**文件：** `poorcode/provider/base.py`
-**依赖：** T1（Tool 类型）
-**步骤：**
-1. 新增 `ToolCallRequest` 数据类（`tool_name: str`、`tool_input: dict`、`tool_use_id: str`）
-2. 在 `LLMProvider.__init__` 中新增可选参数 `tools: list | None = None`，保存为 `self.tools`
-3. `StreamEvent` 注释补充 `tool_call` 和 `tool_error` 两种 type 值
-4. `chat()` 签名不变
-
-**验证：** `python -c "from poorcode.provider.base import ToolCallRequest, LLMProvider"` 无报错；`LLMProvider(config, tools=[])` 正常实例化
-
-## T12: Anthropic Provider 工具调用支持
-
-**文件：** `poorcode/provider/anthropic.py`
-**依赖：** T11
-**步骤：**
-1. `_build_body()` → 当 `self.tools` 非空时，调用 `to_anthropic_format()` 注入 `"tools"` 字段
-2. `chat()` 中新增 tool_use 流式解析状态机：
-   - 用 `_tool_use_count` 计数 content_block_start(type=tool_use)
-   - 用 `_tool_use_buffer` 累积 input_json_delta 的 `partial_json` 片段
-   - 用 `_current_tool_name`、`_current_tool_id` 记录当前工具信息
-   - `content_block_stop` 时：若为 tool_use block → 解析累积 JSON → yield `StreamEvent("tool_call", ToolCallRequest(...).json())`
-   - 当 `_tool_use_count > 1` 时，产出额外的 `StreamEvent("tool_error", "模型请求了 N 个工具...")`
-3. 新增 `format_tool_result(tool_use_id, tool_result: ToolResult) -> dict` 静态方法，返回 Anthropic 格式的 tool_result content block
-4. 新增 `build_tool_result_message(tool_use_id, tool_result) -> Message`，返回 `Message(role="user", content=[tool_result_block])`
-
-**验证：** 暂不独立运行，待 T16 通过 chat loop 整体验证
-
-## T13: OpenAI Provider 工具调用支持
-
-**文件：** `poorcode/provider/openai.py`
-**依赖：** T11
-**步骤：**
-1. `_build_body()` → 当 `self.tools` 非空时，调用 `to_openai_format()` 注入 `"tools"` 字段
-2. `chat()` 中新增 tool_calls 流式解析：
-   - 在现有 delta 解析中增加 `delta.get("tool_calls")` 处理
-   - 按 `tool_calls[].index` 分组累积（用 dict 维护 index → {id, function_name, function_arguments}）
-   - `finish_reason` 出现时：检查累积的 tool_calls，产出 `StreamEvent("tool_call", ...)`
-   - 多个 tool_calls（len > 1）时只取第一个并产出 `tool_error`
-3. 若有 `finish_reason == "tool_calls"`，产出 tool_call 事件后不应再产出 text_delta 的 done
-4. 新增 `format_tool_result(tool_call_id, tool_result)` → `Message(role="tool", content=..., tool_call_id=...)`
-
-**验证：** 暂不独立运行，待 T16 整体验证
-
-## T14: TUI 渲染——工具状态行
-
-**文件：** `poorcode/tui/render.py`
-**依赖：** 无（仅依赖 rich）
-**步骤：**
-1. 实现 `render_tool_status(console, tool_name, status, detail="")`
-   - `status="running"` → 显示 `🔧 {tool_name} … ⏳ 执行中`（黄色）
-   - `status="done"` → 显示 `🔧 {tool_name} … ✅ 完成`（绿色）
-   - `status="error"` → 显示 `🔧 {tool_name} … ❌ {detail}`（红色）
-2. 使用 Rich 的 `Text` 或直接 `console.print()` 渲染一行
-
-**验证：** 临时脚本调用三种状态，观察终端输出颜色和图标是否正确
-
-## T15: TuiApp 工具状态方法
-
-**文件：** `poorcode/tui/app.py`
-**依赖：** T14
-**步骤：**
-1. 新增 `show_tool_status(name, status, detail="")`——调用 `render_tool_status()`
-2. 修改 `finish_streaming()`——不再默认渲染 Markdown。当流式结束没有 full_text 时（工具调用场景），仅更新状态栏
-3. 新增 `finish_tool_response(full_text)`——工具调用后的回复渲染（本质上复用 finish_streaming 的 Markdown 渲染逻辑，但不做流式 Live 清理）
-
-**验证：** 实例化 TuiApp → 调用 `show_tool_status("read", "running")` → `show_tool_status("read", "done")` → 观察终端输出
-
-## T16: Chat Loop 工具调用编排
+## T10: Chat Loop 重写为编排层 + Plan Mode
 
 **文件：** `poorcode/chat.py`
-**依赖：** T3, T10, T12, T13, T15
+
+**依赖：** T6、T7、T8、T9
+
 **步骤：**
-1. 导入 `poorcode.tools`（触发自动注册）和 `ToolContext`、`ToolResult`
-2. `run()` 中创建 Provider 后，`provider = create_provider(config)` → `provider.tools = list_tools()`（或通过构造函数传入）
-3. 流式循环中新增事件处理：
-   - `event.type == "tool_error"` → `tui.show_error(event.content)`，追加提示到 history，continue 下一轮
-   - `event.type == "tool_call"` → 解析 `ToolCallRequest`：
-     a. `tui.show_tool_status(name, "running")`
-     b. `tool = registry.get(tool_name)`，若找不到 → `tui.show_tool_status(name, "error", "工具未注册")` + 返回错误给模型
-     c. 构造 `ToolContext(cwd=Path.cwd(), timeout=tool.default_timeout)`
-     d. `result = await tool.execute(tool_input, context)`
-     e. `tui.show_tool_status(name, "done" if result.success else "error", result.error or "")`
-     f. 调用 `provider.format_tool_result()` 构造协议消息，追加到 history
-     g. 第二次调用 `provider.chat(messages=history)`，流式渲染文本回复
-     h. 追加 assistant Message 到 history，本次循环结束（不检查新 tool_use）
-4. 注意：工具调用后的第二次 chat 中若出现新的 `tool_call`，产出 `tool_error` 而非继续执行
-5. 工具执行期间捕获异常，转为 `ToolResult(success=False, ...)` 不崩溃
+1. 导入 `AgentLoop`、`AgentEvent` 类型、`StopChecker`
+2. 移除当前内联的工具调用处理逻辑（`_handle_tool_call`、`_append_tool_messages`、`_had_tool_call`），这些逻辑由 Agent Loop 内部处理
+3. 新增 `AgentMode` 枚举：`PLAN`、`DO`，初始为 `DO`
+4. 新增 `_get_tools_for_mode(mode: AgentMode) -> list[Tool]`：
+   - `PLAN` → 筛选 category=="read" 的工具
+   - `DO` → 全部工具
+5. 新增 `_handle_command(user_input: str) -> tuple[bool, str]`：
+   - `/plan` → 切换 mode=PLAN，返回 `(True, "已切换到 Plan Mode，仅可调研代码")`
+   - `/do` → 切换 mode=DO，返回 `(True, "已切换到执行模式，可修改文件")`
+   - `/quit`、`/exit` → 返回 `(True, "")`
+   - 其他 → 返回 `(False, "")`
+6. 重写 `run()` 函数：
+   - 加载配置（含 `max_iterations`）
+   - 创建 Provider，根据当前 mode 设置 `provider.tools`
+   - 初始化 TUI
+   - **主循环**：
+     - 获取用户输入
+     - 若为命令（`/plan`、`/do`、`/quit`），处理命令，显示提示，continue
+     - 若为普通输入：
+       - `tui.show_user_message(text)`
+       - 追加到 history
+       - `mode = DO` 时：全工具模式
+       - `mode = PLAN` 时：筛选 tools 只含读类，重新设置 `provider.tools`
+       - 创建 `AgentLoop(provider, tools, config.max_iterations)`
+       - 消费 AgentEvent 流：
+         - `text_delta` → `tui.begin_streaming()` + `tui.stream_delta()`
+         - `tool_call` → 记录但不渲染（等 tool_result）
+         - `tool_result` → `tui.show_tool_status(name, "done"/"error")`
+         - `token_usage` → `tui.show_token_usage()`
+         - `agent_progress` → `tui.show_agent_progress()`
+         - `agent_done` → `tui.show_agent_done()` + 追加 assistant 消息到 history
+         - `error` → `tui.show_error()`（可恢复的不中断，不可恢复的中断）
+       - Agent Loop 结束后回到输入等待
+7. 处理 `Esc`：在输入等待时用 `asyncio.Event` 作为取消标志传给 AgentLoop；`Ctrl+C` 退出程序
+8. 移除旧有的 `_handle_tool_call`、`_append_tool_messages`、`_had_tool_call` 函数
 
-**验证：** 配置有效 API Key 后启动，输入「读一下 README.md」，观察工具调用→执行→回复的完整流程
-
-## T17: Provider 包初始化更新（如需）
-
-**文件：** `poorcode/provider/__init__.py`
-**依赖：** T12, T13
-**步骤：**
-1. 确认 `__all__` 导出列表包含 `ToolCallRequest`（如果 chat.py 需要从此导入）
-
-**验证：** `python -c "from poorcode.provider import ToolCallRequest, LLMProvider, create_provider"` 无报错
+**验证：** `python -m poorcode` 启动正常；输入「你好」→ 流式回复正常；输入 `/plan` → 显示模式切换提示；输入 `/do` → 切换回执行模式
 
 ## 执行顺序
 
 ```
-T1 (Tool 抽象基类)
- │
- ├── T2 (路径安全) ──┬── T4 (Read) ──────────┐
- │                   ├── T5 (Write)            │
- │                   ├── T6 (Edit)             ├── T10 (工具包初始化)
- │                   ├── T8 (Glob)             │
- │                   └── T9 (Grep)             │
- │                                             │
- ├── T3 (注册中心) ────────────────────────────┤
- │                                             │
- └── T7 (Bash) ───────────────────────────────┘
-
-T11 (Provider 基类变更)
- │
- ├── T12 (Anthropic 工具解析) ──┐
- │                              ├── T17 (Provider 包更新)
- └── T13 (OpenAI 工具解析) ────┘
-
-T14 (render_tool_status) ── T15 (TuiApp 工具方法)
-
-T10 + T15 + T12 + T13 + T17 ──── T16 (Chat Loop 编排)
+Phase 1（并行，无依赖）
+    T1 (category)  +  T2 (events)  +  T4 (stop)  +  T8 (config)
+         │                  │              │              │
+Phase 2（并行）              │              │              │
+    T3 (collector, dep: T2) │              │              │
+    T5 (executor, dep: T1, T2)            │              │
+    T9 (TUI, dep: T2)                     │              │
+         │                  │              │              │
+Phase 3                      ↓              ↓              │
+    T6 (loop, dep: T3 + T4 + T5)                          │
+         │                                                 │
+Phase 4   ↓                                                 │
+    T7 (__init__, dep: T6)                                 │
+         │                                                 │
+Phase 5   ↓                                                 ↓
+    T10 (chat rewrite, dep: T6 + T7 + T8 + T9)
 ```
-
-- T2, T3, T7 在 T1 完成后可并行
-- T4-T6, T8-T9 在 T2 完成后可并行
-- T12, T13 在 T11 完成后可并行
-- T14 独立可并行
-- T16 是最后集线器，依赖 T10, T12, T13, T15

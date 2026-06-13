@@ -8,6 +8,7 @@ class WriteTool(Tool):
     """创建或覆盖文件."""
 
     name = "write"
+    category = "write"
     description = "创建或覆盖文件内容。父目录不存在时自动创建。用于新建文件或完全重写现有文件。"
     parameters = {
         "type": "object",

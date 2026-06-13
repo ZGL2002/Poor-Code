@@ -1,83 +1,92 @@
-# 工具系统 Checklist
+# Agent Loop Checklist
 
 > 每一项通过运行代码或观察行为来验证，聚焦系统行为。
 
 ## 实现完整性
 
-- [ ] C1: 所有 16 个文件已创建或修改（验证：`find poorcode -name '*.py' | wc -l` 输出 ≥20；`ls poorcode/tools/` 含 10 个文件）
-- [ ] C2: 六个工具全部注册（验证：`python -c "from poorcode.tools import list_tools; print([t.name for t in list_tools()])"` 输出 `['read', 'write', 'edit', 'bash', 'glob', 'grep']`）
-- [ ] C3: Tool 抽象基类可正常导入（验证：`python -c "from poorcode.tools.base import Tool, ToolResult, ToolContext"` 无报错）
-- [ ] C4: Provider 基类支持 tools 参数（验证：`python -c "from poorcode.provider.base import LLMProvider, ProviderConfig; c=ProviderConfig('anthropic','m','url','key'); p=LLMProvider(c, tools=[])"` 无报错）
-- [ ] C5: ToolCallRequest 可导入（验证：`python -c "from poorcode.provider.base import ToolCallRequest"` 无报错）
+- [ ] C1: Agent 包全部 5 个模块文件存在（验证：`ls poorcode/agent/` 输出 `__init__.py events.py collector.py executor.py stop.py loop.py`）
+- [ ] C2: Tool 基类含 `category` 属性（验证：`python -c "from poorcode.tools.base import Tool; print(hasattr(Tool, 'category'))"` 输出 `True`）
+- [ ] C3: 六个工具 category 正确分类（验证：`python -c "from poorcode.tools import list_tools; cats = {t.name: t.category for t in list_tools()}; print(cats)"` 输出 3 个 read + 3 个 write）
+- [ ] C4: 配置 `max_iterations` 可读取（验证：`python -c "from poorcode.config import load_config; print(load_config().max_iterations)"` 输出 `25`）
+- [ ] C5: AgentEvent 全部类型可导入（验证：`python -c "from poorcode.agent import AgentLoop, AgentProgressEvent, AgentDoneEvent, TextDeltaEvent, ToolCallEvent, ToolResultEvent, TokenUsageEvent, ErrorEvent"` 无报错）
 
-## 工具功能验证
+## 工具执行器
 
-- [ ] C6: Read 工具读取文件（验证：`python -c "import asyncio; from poorcode.tools.read import ReadTool; from poorcode.tools.base import ToolContext; from pathlib import Path; r=asyncio.run(ReadTool().execute({'file_path':'README.md'}, ToolContext(Path.cwd(),30))); print(r.success, r.content[:100])"` → success=True，输出 README 内容）
-- [ ] C7: Read 工具文件不存在（验证：同上但 file_path='__nonexistent__' → success=False, error='not_found'）
-- [ ] C8: Write 工具创建文件（验证：执行写入 → 检查文件存在 → 内容一致 → 清理测试文件）
-- [ ] C9: Edit 工具精确替换（验证：创建临时文件含 'hello' → edit(old='hello', new='world') → 检查文件内容变为 'world' → 清理）
-- [ ] C10: Edit 工具多处匹配报错（验证：文件含两行 'hello' → edit(old='hello') → success=False, error='not_unique'）
-- [ ] C11: Edit 工具未找到报错（验证：文件不含 'xyz' → edit(old='xyz') → success=False, error='not_found'）
-- [ ] C12: Bash 工具执行命令（验证：`command='echo hello'` → success=True, stdout 含 'hello'）
-- [ ] C13: Bash 工具超时（验证：`command='sleep 120'` + timeout=2 → success=False, error='timeout'）
-- [ ] C14: Glob 工具匹配文件（验证：`pattern='**/*.py'` → 返回 .py 文件列表）
-- [ ] C15: Grep 工具搜索代码（验证：`pattern='import'` → 返回各行含 import 的文件、行号、内容）
-- [ ] C16: 路径越界被拒绝（验证：Read file_path='/etc/passwd' → success=False, 提示路径越界）
-- [ ] C17: 工具结果截断（验证：创建 >100KB 文件 → Read 读取 → content 末尾含 '...(内容已截断, 超过 100KB)'）
+- [ ] C6: 读类并发执行（验证：创建两个 Read call → execute_all → 两个 tool_result 事件产出且耗时约等于单次 Read）
+- [ ] C7: 写类串行执行（验证：创建两个 Write call → execute_all → 第一个完成后第二个才开始）
+- [ ] C8: 混合分批（验证：创建一个 Read + 一个 Write → execute_all → Read 先完成，Write 后完成）
+- [ ] C9: 未注册工具返回错误结果（验证：ToolCallRequest(tool_name="nonexistent") → execute_all → 产出 ToolResultEvent(success=False)）
 
-## 集成验证
+## 停止条件
 
-- [ ] C18: Provider 注册表可扩展（验证：注册新协议 → `create_provider()` 正确实例化 → 已有行为不被破坏）
-- [ ] C19: 工具注册表可扩展（验证：`register(MyTool())` → `get('mytool')` 能找到 → `list_tools()` 含新工具）
-- [ ] C20: `to_anthropic_format()` 输出正确（验证：输出为 list[dict]，每项含 name、description、input_schema 三个字段）
-- [ ] C21: `to_openai_format()` 输出正确（验证：输出为 list[dict]，每项含 type='function' 和嵌套的 function 对象）
-- [ ] C22: 不传工具时行为不变（验证：`provider = create_provider(config)` 不传 tools → 纯文本对话正常，无工具调用）
-- [ ] C23: Provider chat() 签名未被破坏（验证：现有调用 `provider.chat(messages=history, stream=True)` 仍可用）
+- [ ] C10: 自然停止（验证：Agent Loop 收到无工具调用的 LLM 响应 → 产出 AgentDoneEvent(reason="natural_stop")）
+- [ ] C11: 迭代上限（验证：max_iterations=2，发需要多轮工具的任务 → 第 2 轮后产出 AgentDoneEvent(reason="max_iterations")）
+- [ ] C12: 连续未知工具（验证：连续 3 次调用未注册工具 → 产出 AgentDoneEvent(reason="consecutive_unknown_tools")）
+- [ ] C13: 流错误停止（验证：模拟 Provider 抛异常 → 产出 AgentDoneEvent(reason="stream_error")）
+
+## 事件流
+
+- [ ] C14: text_delta 实时转发（验证：流式接收期间，text_delta 事件逐个产出，不等待流结束）
+- [ ] C15: 流式结束后 tool_calls 完整（验证：collector 的 tool_calls 列表包含本次所有工具调用）
+- [ ] C16: agent_progress 每轮产出（验证：Agent Loop 每轮开始产出 AgentProgressEvent，含正确 iteration）
+- [ ] C17: token_usage 每轮产出（验证：LLM 调用结束后 TokenUsageEvent 被产出）
+- [ ] C18: agent_done 结束信号（验证：Agent Loop 退出前最后一个事件是 AgentDoneEvent）
+
+## Plan Mode
+
+- [ ] C19: /plan 切换模式（验证：输入 /plan → 终端提示切换到 Plan Mode）
+- [ ] C20: Plan Mode 限制工具（验证：/plan 后，传给 Provider 的 tools 仅含 Read/Glob/Grep）
+- [ ] C21: /do 切换回全工具（验证：/do 后，传给 Provider 的 tools 恢复全部六个）
+- [ ] C22: 命令不影响对话历史（验证：/plan 和 /do 不追加到 history）
 
 ## 编译与测试
 
-- [ ] C24: Python 语法无错误（验证：`python -m compileall poorcode/` 全部通过）
-- [ ] C25: `python -m poorcode` 可正常启动（验证：启动后显示欢迎界面，无 import 错误或 traceback）
-- [ ] C26: 项目可正常安装（验证：`pip install -e .` 无错误）
+- [ ] C23: Python 语法无错误（验证：`python -m compileall poorcode/` 全部通过）
+- [ ] C24: `python -m poorcode` 可正常启动（验证：启动后显示欢迎界面，无 import 错误或 traceback）
+- [ ] C25: 项目可正常安装（验证：`pip install -e .` 无错误）
 
 ## 端到端场景
 
-- [ ] C27: 场景 1 — 读取文件工具调用
-  - 操作：配置有效 API Key → 启动 `python -m poorcode` → 输入「读一下 README.md」→ 观察终端显示「🔧 read … ⏳ 执行中」→ 等待→ 显示「🔧 read … ✅ 完成」→ 模型基于文件内容生成文本回复 → 输入「/quit」
-  - 预期：工具调用状态行正确显示，模型回复引用 README.md 内容
+- [ ] C26: 场景 1 — 单轮工具自主完成
+  - 操作：配置有效 API Key → 启动 → 输入「读一下 README.md」→ 不输入任何其他内容
+  - 预期：终端显示工具调用状态（🔧 read … ✅ 完成）→ 模型基于文件内容生成回复 → Agent Loop 自动停止 → 等待下一轮输入
 
-- [ ] C28: 场景 2 — 编辑文件工具调用
-  - 操作：启动 → 输入「把 README.md 中的所有 PoorCode 替换为 RichCode」→ 模型调用 edit 工具 → 终端显示「🔧 edit … ✅ 完成」→ 输入「读一下 README.md 验证」→ 模型调用 read → 回复确认替换生效 → 手动还原文件
-  - 预期：Edit 成功执行，Read 验证内容已改
+- [ ] C27: 场景 2 — 多轮工具自主推进
+  - 操作：启动 → 输入「先找到所有 .py 文件，再搜索其中包含 import 的行」
+  - 预期：Glob 执行 → Grep 执行 → 模型汇总结果 → 全过程无需用户催促
 
-- [ ] C29: 场景 3 — 文件不存在时的错误恢复
-  - 操作：启动 → 输入「读一下 notexist.txt」→ 模型调用 read → 终端显示「🔧 read … ❌ not_found」→ 模型在回复中说明文件不存在 → 程序不崩溃
-  - 预期：工具失败不崩溃，模型基于错误信息给出合理回复
+- [ ] C28: 场景 3 — 迭代上限兜底
+  - 操作：修改 config.yaml 中 max_iterations=2 → 启动 → 输入复杂任务（需要多次工具调用）
+  - 预期：Agent Loop 在 2 轮后停止 → 终端显示「达到迭代上限」
 
-- [ ] C30: 场景 4 — 执行命令工具调用
-  - 操作：启动 → 输入「用 ls -la 列出当前目录」→ 终端显示「🔧 bash … ✅ 完成」→ 模型列出目录内容
-  - 预期：Bash 工具正确执行，结果在模型回复中呈现
+- [ ] C29: 场景 4 — 纯文本对话（0 轮工具）
+  - 操作：启动 → 输入「你好」→ 模型回复
+  - 预期：无工具调用 → Agent Loop 立即停止 → 流式回复正常
 
-- [ ] C31: 场景 5 — 搜索代码工具调用
-  - 操作：启动 → 输入「搜索项目中的所有 Python 文件」→ 模型调用 glob → 终端显示「🔧 glob … ✅ 完成」→ 模型列出 .py 文件 → 输入「搜索所有 import 语句」→ 模型调用 grep → 模型汇总搜索结果
-  - 预期：Glob 和 Grep 正常工作，结果准确
+- [ ] C30: 场景 5 — 模型基于错误自行纠错
+  - 操作：启动 → 输入「读一下 notexist.txt」
+  - 预期：Read 返回错误 → 模型可能尝试 Glob 搜索相似文件名 → 不再盲目重试同一路径
 
-- [ ] C32: 场景 6 — 多工具被拒绝
-  - 操作：启动 → 输入「同时读一下 README.md 和 chat.py」→ 若模型尝试调用多个工具 → 终端显示错误（「模型请求了 2 个工具…」或模型只调了 1 个且说明原因）→ 程序不崩溃
-  - 预期：多工具场景下程序正确处理，不崩溃
+- [ ] C31: 场景 6 — 多工具并发读
+  - 操作：启动 → 输入「同时读 README.md 和 CLAUDE.md」
+  - 预期：两个 Read 并发执行 → 两个结果都返回 → 模型回复
 
-- [ ] C33: 场景 7 — 路径越界被拒绝
-  - 操作：启动 → 输入「读 /etc/passwd」→ 模型调用 read → 终端显示「🔧 read … ❌」或「路径越界」→ 模型回复说明无法访问 → 程序不崩溃
-  - 预期：安全限制生效
+- [ ] C32: 场景 7 — Plan Mode 调研 + 执行
+  - 操作：启动 → 输入 /plan → 输入「我想修改 README.md 的标题，先帮我看看项目结构」→ 模型只能读/搜索 → 输入 /do → 输入「现在改标题」→ 模型可 Edit
+  - 预期：Plan 阶段无写操作，Do 阶段可用全部工具
 
-- [ ] C34: 场景 8 — 不配置工具时纯文本对话
-  - 操作：修改 `chat.py` 不传 tools（模拟关闭）→ 启动 → 输入「你好」→ 流式回复正常 → 多次对话 → 上下文记忆正常
-  - 预期：纯文本对话行为与当前版本完全一致
+- [ ] C33: 场景 8 — Esc 取消 Agent Loop
+  - 操作：启动 → 输入触发 Agent Loop 的任务 → 执行中按 Esc
+  - 预期：当前轮次停止 → 回到输入等待状态 → 对话历史保留
 
-- [ ] C35: 场景 9 — API 认证失败时工具调用
-  - 操作：填写无效 api_key → 启动 → 输入「读一下 README.md」→ 程序给出中文认证错误提示 → 不崩溃
-  - 预期：认证错误不影响工具系统的健壮性
+- [ ] C34: 场景 9 — 连续工具调用不崩溃
+  - 操作：启动 → 进行 5+ 轮工具调用的复杂任务
+  - 预期：全程无崩溃 → 每轮进度可见 → 最终完成或达到上限
 
-- [ ] C36: 场景 10 — 20 轮混合对话
-  - 操作：启动 → 交替进行纯文本对话和工具调用（读文件、执行命令、搜索代码）→ 总计 20 轮 → 输入「/quit」
-  - 预期：全程无卡顿，无内存持续增长，每轮上下文正确
+- [ ] C35: 场景 10 — 不配置工具时兼容
+  - 操作：修改 chat.py 不传 tools → 启动 → 输入「你好」
+  - 预期：流式回复正常 → 无 Agent Loop 相关错误 → 多轮对话正常
+
+- [ ] C36: 场景 11 — 进度和 Token 可见
+  - 操作：启动 → 输入触发工具调用的任务
+  - 预期：终端可见「🔄 第 1/25 轮」等进度信息 → 结束后可见 Token 用量或停止原因摘要

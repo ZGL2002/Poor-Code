@@ -14,6 +14,7 @@ class EditTool(Tool):
     """
 
     name = "edit"
+    category = "write"
     description = (
         "修改文件内容：在文件中查找指定原文（old_string）并替换为新文（new_string）。"
         "要求原文精确唯一匹配——匹配到 0 处或 >1 处均报错且不修改文件。"

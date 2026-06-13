@@ -34,6 +34,7 @@ class Tool(ABC):
 
     name: str = ""
     description: str = ""
+    category: str = "read"  # "read" 无副作用, "write" 有副作用——用于并发/串行调度
     parameters: dict = field(default_factory=dict)
 
     @abstractmethod

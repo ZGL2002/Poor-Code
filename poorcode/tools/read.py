@@ -10,6 +10,7 @@ class ReadTool(Tool):
     """读取指定文件的内容."""
 
     name = "read"
+    category = "read"
     description = "读取文件内容。返回文件全文和总行数。用于查看代码、配置、文档等文本文件。"
     parameters = {
         "type": "object",

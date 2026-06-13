@@ -107,3 +107,72 @@ def render_error(console: Console, message: str) -> None:
     console.print()
     console.print(f"  ❌ {message}", style="bold red")
     console.print()
+
+
+def render_agent_progress(
+    console: Console,
+    iteration: int,
+    max_iterations: int,
+) -> None:
+    """渲染 Agent Loop 循环进度.
+
+    Args:
+        console: Rich Console.
+        iteration: 当前轮次（从 1 开始）.
+        max_iterations: 最大轮次.
+    """
+    console.print(
+        f"🔄 第 {iteration}/{max_iterations} 轮",
+        style="bold cyan",
+    )
+
+
+def render_agent_done(
+    console: Console,
+    reason: str,
+    total_iterations: int,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> None:
+    """渲染 Agent Loop 结束摘要.
+
+    Args:
+        console: Rich Console.
+        reason: 停止原因.
+        total_iterations: 总迭代轮次.
+        input_tokens: 总输入 Token 数.
+        output_tokens: 总输出 Token 数.
+    """
+    reason_labels = {
+        "natural_stop": "✅ 完成",
+        "max_iterations": "⏰ 达到迭代上限",
+        "user_cancel": "🛑 用户取消",
+        "consecutive_unknown_tools": "⚠️ 连续调用未注册工具",
+        "stream_error": "❌ 流式错误",
+    }
+    label = reason_labels.get(reason, f"停止（{reason}）")
+
+    parts = [f"{label}（{total_iterations} 轮"]
+    if input_tokens or output_tokens:
+        parts.append(f"，{input_tokens}+{output_tokens} tokens")
+    parts.append("）")
+
+    console.print("".join(parts), style="dim")
+
+
+def render_token_usage(
+    console: Console,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    """渲染单次 LLM 调用的 Token 用量.
+
+    Args:
+        console: Rich Console.
+        input_tokens: 输入 Token 数.
+        output_tokens: 输出 Token 数.
+    """
+    console.print(
+        f"📊 Token: {input_tokens} in + {output_tokens} out",
+        style="dim",
+    )

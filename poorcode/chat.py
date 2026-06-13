@@ -1,144 +1,67 @@
-"""Chat Loop 编排——应用主循环，含工具调用检测与执行."""
+"""Chat Loop 编排层——用户输入循环 + Plan Mode + Agent Loop 驱动."""
 
-import json
+import asyncio
 import os
+from enum import Enum
 from pathlib import Path
 
 from poorcode import __version__
+from poorcode.agent import (
+    AgentDoneEvent,
+    AgentLoop,
+    AgentProgressEvent,
+    ErrorEvent,
+    TextDeltaEvent,
+    TokenUsageEvent,
+)
+from poorcode.agent.events import ToolResultEvent
 from poorcode.config import load_config
 from poorcode.provider import create_provider
-from poorcode.provider.base import (
-    LLMProvider,
-    Message,
-    ProviderConfig,
-    StreamEvent,
-    ToolCallRequest,
-)
+from poorcode.provider.base import LLMProvider, Message
+from poorcode.tools import list_tools
+from poorcode.tools.base import Tool
 from poorcode.tui import TuiApp
 
-# 导入工具系统（触发自动注册）
-from poorcode.tools import get as get_tool
-from poorcode.tools import list_tools
-from poorcode.tools.base import ToolContext, ToolResult
+
+class AgentMode(Enum):
+    """Agent 工作模式."""
+    PLAN = "plan"  # 仅读类工具
+    DO = "do"      # 全部工具
 
 
-def _build_tool_context(cwd: Path, timeout: float) -> ToolContext:
-    """构造工具执行上下文."""
-    return ToolContext(cwd=cwd, timeout=timeout)
-
-
-async def _handle_tool_call(
-    request: ToolCallRequest,
-    provider: LLMProvider,
-    history: list[Message],
-    tui: TuiApp,
-    cwd: Path,
-) -> None:
-    """执行工具调用并将结果回灌对话历史.
+def _get_tools_for_mode(mode: AgentMode) -> list[Tool]:
+    """根据模式筛选工具列表.
 
     Args:
-        request: 工具调用请求.
-        provider: LLM Provider 实例.
-        history: 对话历史（原地修改）.
-        tui: TUI 实例.
-        cwd: 工作目录.
+        mode: PLAN 仅返回读类工具, DO 返回全部.
+
+    Returns:
+        筛选后的 Tool 列表.
     """
-    tool_name = request.tool_name
-    tool_input = request.tool_input
-    tool_use_id = request.tool_use_id
-
-    # 查找工具
-    tool = get_tool(tool_name)
-    if tool is None:
-        tui.show_tool_status(tool_name, "error", "工具未注册")
-        # 构建错误结果
-        error_result = ToolResult(
-            success=False,
-            error="unknown_tool",
-            content=f"工具 '{tool_name}' 未注册。可用工具：{[t.name for t in list_tools()]}",
-        )
-        _append_tool_messages(provider, history, tool_use_id, tool_name, tool_input, error_result)
-        return
-
-    # 执行工具
-    tui.show_tool_status(tool_name, "running")
-    context = _build_tool_context(cwd, tool.default_timeout)
-
-    try:
-        result = await tool.execute(tool_input, context)
-    except Exception as e:
-        result = ToolResult(
-            success=False,
-            error="exception",
-            content=f"工具执行异常：{e}",
-        )
-
-    # 显示结果状态
-    if result.success:
-        tui.show_tool_status(tool_name, "done")
-    else:
-        tui.show_tool_status(tool_name, "error", result.error or "")
-
-    # 将工具调用和结果追加到历史
-    _append_tool_messages(provider, history, tool_use_id, tool_name, tool_input, result)
+    all_tools = list_tools()
+    if mode == AgentMode.PLAN:
+        return [t for t in all_tools if t.category == "read"]
+    return all_tools
 
 
-def _append_tool_messages(
-    provider: LLMProvider,
-    history: list[Message],
-    tool_use_id: str,
-    tool_name: str,
-    tool_input: dict,
-    result: ToolResult,
-) -> None:
-    """将工具调用消息和工具结果消息追加到对话历史.
+def _handle_command(user_input: str) -> tuple[bool, str | None]:
+    """解析用户命令.
 
-    不同协议构造不同的消息格式.
+    Args:
+        user_input: 用户输入字符串.
+
+    Returns:
+        (is_command, response): is_command 表示是否为命令,
+        response 是命令的响应消息（普通消息时为 None）。
     """
-    # 获取 provider 的具体类型以调用正确的静态方法
-    provider_type = type(provider).__name__
-
-    if provider_type == "AnthropicProvider":
-        from poorcode.provider.anthropic import AnthropicProvider
-
-        # 追加 assistant 消息（含 tool_use block）
-        history.append(
-            AnthropicProvider.build_tool_use_message(
-                tool_use_id, tool_name, tool_input
-            )
-        )
-        # 追加 user 消息（含 tool_result block）
-        history.append(
-            AnthropicProvider.build_tool_result_message(
-                tool_use_id, result
-            )
-        )
-    elif provider_type == "OpenAIProvider":
-        from poorcode.provider.openai import OpenAIProvider
-
-        # 追加 assistant 消息（含 tool_calls）
-        history.append(
-            OpenAIProvider.build_tool_use_message(
-                tool_use_id, tool_name, tool_input
-            )
-        )
-        # 追加 tool 消息（含 tool_call_id）
-        history.append(
-            OpenAIProvider.build_tool_result_message(
-                tool_use_id, result
-            )
-        )
-    else:
-        # 回退：纯文本追加
-        history.append(
-            Message(role="assistant", content=f"[调用工具 {tool_name}]")
-        )
-        history.append(
-            Message(
-                role="user",
-                content=f"工具 {tool_name} 结果：{result.content}",
-            )
-        )
+    stripped = user_input.strip().lower()
+    if stripped in ("/quit", "/exit"):
+        return True, None  # None 表示退出
+    if stripped == "/plan":
+        return True, "plan"
+    if stripped == "/do":
+        return True, "do"
+    return False, None
 
 
 async def run() -> int:
@@ -148,26 +71,29 @@ async def run() -> int:
         int: 退出码，0 表示正常退出.
     """
     # 1. 加载配置
-    config = load_config()
+    app_config = load_config()
+    provider_config = app_config.provider
 
-    # 2. 创建 Provider（传入全部已注册工具）
-    provider: LLMProvider = create_provider(config)
-    provider.tools = list_tools()
+    # 2. 创建 Provider
+    provider: LLMProvider = create_provider(provider_config)
 
     # 3. 初始化 TUI
     cwd = os.getcwd()
     tui = TuiApp(
-        provider_name=config.protocol,
-        model_name=config.model,
+        provider_name=provider_config.protocol,
+        model_name=provider_config.model,
         version=__version__,
         cwd=cwd,
     )
     tui.start()
 
-    # 4. 对话循环
+    # 4. Agent Loop 状态
     history: list[Message] = []
+    mode: AgentMode = AgentMode.DO
+    cancel_event = asyncio.Event()
 
     while True:
+        # 获取用户输入
         try:
             user_input = await tui.get_input()
         except EOFError:
@@ -177,115 +103,97 @@ async def run() -> int:
         if not user_input.strip():
             continue
 
-        # 退出命令
-        if user_input.strip().lower() in ("/quit", "/exit"):
-            tui.console.print("\n👋 再见！", style="bold")
-            break
+        # 命令处理
+        is_cmd, cmd = _handle_command(user_input)
+        if is_cmd:
+            if cmd is None:
+                # /quit, /exit
+                tui.console.print("\n👋 再见！", style="bold")
+                break
+            elif cmd == "plan":
+                mode = AgentMode.PLAN
+                tui.console.print("📋 已切换到 Plan Mode（仅可调研代码）", style="bold cyan")
+            elif cmd == "do":
+                mode = AgentMode.DO
+                tui.console.print("🔧 已切换到执行模式（可修改文件）", style="bold cyan")
+            continue
 
-        # 追加用户消息
+        # 普通对话
+        tui.show_user_message(user_input)
         history.append(Message(role="user", content=user_input))
 
-        # 调用 Provider 流式对话
-        tui.begin_streaming()
-        full_response = ""
+        # 根据模式设置工具
+        tools = _get_tools_for_mode(mode)
+        provider.tools = tools
+
+        # 创建 Agent Loop
+        loop = AgentLoop(
+            provider=provider,
+            tools=tools,
+            max_iterations=app_config.max_iterations,
+            cancel_event=cancel_event,
+        )
+
+        # 消费 AgentEvent 流
+        full_text = ""
+        in_streaming = False
+        agent_done: AgentDoneEvent | None = None
+        cancel_event.clear()
 
         try:
-            async for event in provider.chat(messages=history, stream=True):
-                if event.type == "text_delta":
-                    full_response += event.content
-                    tui.stream_delta(event.content)
-
-                elif event.type == "thinking_delta":
-                    # 缓存但不展示
-                    pass
-
-                elif event.type == "tool_error":
-                    # 工具调用解析失败
-                    tui.show_error(event.content)
-
-                elif event.type == "tool_call":
-                    # 收到完整的工具调用请求
-                    try:
-                        request_data = json.loads(event.content)
-                        request = ToolCallRequest(
-                            tool_name=request_data["tool_name"],
-                            tool_input=request_data["tool_input"],
-                            tool_use_id=request_data["tool_use_id"],
-                        )
-                    except (json.JSONDecodeError, KeyError) as e:
-                        tui.show_error(f"工具调用解析失败：{e}")
-                        # 让流式结束
-                        tui.finish_streaming("")
-                        break
-
-                    # 停止流式显示
-                    tui.finish_streaming("")
-
-                    # 执行工具并将结果注入历史
-                    await _handle_tool_call(
-                        request, provider, history, tui, Path(cwd)
+            async for event in loop.run(history=history):
+                if isinstance(event, AgentProgressEvent):
+                    tui.show_agent_progress(
+                        event.iteration, event.max_iterations
                     )
 
-                    # 第二次调用 Provider：获取模型对工具结果的文本回复
-                    tui.begin_streaming()
-                    full_response = ""
-                    try:
-                        async for event2 in provider.chat(
-                            messages=history, stream=True
-                        ):
-                            if event2.type == "text_delta":
-                                full_response += event2.content
-                                tui.stream_delta(event2.content)
+                elif isinstance(event, TextDeltaEvent):
+                    if not in_streaming:
+                        tui.begin_streaming()
+                        in_streaming = True
+                        full_text = ""
+                    full_text += event.content
+                    # 不逐个 push delta，等 done 后一次性渲染 Markdown
+                    # （Rich Live 模式下文本已经实时显示了）
 
-                            elif event2.type == "thinking_delta":
-                                pass
+                elif isinstance(event, ToolResultEvent):
+                    tui.show_tool_status(
+                        event.tool_name,
+                        "done" if event.success else "error",
+                        event.error or "",
+                    )
 
-                            elif event2.type == "tool_call":
-                                # 模型尝试再次调用工具——本次不支持，忽略
-                                tui.show_error(
-                                    "模型尝试再次调用工具，当前版本不支持自动循环。"
-                                )
+                elif isinstance(event, TokenUsageEvent):
+                    tui.show_token_usage(
+                        event.input_tokens, event.output_tokens
+                    )
 
-                            elif event2.type == "tool_error":
-                                tui.show_error(event2.content)
+                elif isinstance(event, AgentDoneEvent):
+                    agent_done = event
+                    # 先结束流式
+                    if in_streaming and full_text.strip():
+                        tui.finish_streaming(full_text)
+                        in_streaming = False
+                    tui.show_agent_done(
+                        event.reason,
+                        event.total_iterations,
+                        event.total_input_tokens,
+                        event.total_output_tokens,
+                    )
 
-                            elif event2.type == "done":
-                                tui.finish_streaming(full_response)
-                                break
-                    except Exception as e:
-                        tui.show_error(f"{e}")
+                elif isinstance(event, ErrorEvent):
+                    tui.show_error(event.message)
+                    if not event.recoverable:
+                        break
 
-                    # 无论第二次调用成功与否，本轮结束（不继续循环工具调用）
-                    if full_response.strip():
-                        history.append(
-                            Message(role="assistant", content=full_response)
-                        )
-                    break  # 跳出外层 for 循环
+        except KeyboardInterrupt:
+            # 用户按 Ctrl+C 取消当前 Agent Loop
+            cancel_event.set()
+            tui.show_error("Agent Loop 已取消")
+            # 恢复输入
+            in_streaming = False
 
-                elif event.type == "done":
-                    tui.finish_streaming(full_response)
-                    break
-
-            # 追加助手消息到历史（纯文本回复的情况）
-            if full_response.strip() and not _had_tool_call(history, full_response):
-                history.append(Message(role="assistant", content=full_response))
-
-        except Exception as e:
-            tui.show_error(f"{e}")
-            # 不崩溃，继续下一轮
+        if in_streaming and full_text.strip():
+            tui.finish_streaming(full_text)
 
     return 0
-
-
-def _had_tool_call(history: list[Message], last_response: str) -> bool:
-    """检查本轮对话是否已经通过工具调用的第二次 chat 追加过 assistant 消息.
-
-    简单判断：如果 history 最后一条是 assistant 且内容非纯文本，说明已追加.
-    """
-    if not history:
-        return False
-    last = history[-1]
-    if last.role != "assistant":
-        return False
-    # 如果最后一条 assistant 消息的内容不是纯字符串，则是工具调用追加的
-    return not isinstance(last.content, str)

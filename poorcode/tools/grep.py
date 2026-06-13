@@ -11,6 +11,7 @@ class GrepTool(Tool):
     """在文件中搜索匹配正则表达式的行."""
 
     name = "grep"
+    category = "read"
     description = (
         "在代码中搜索匹配正则表达式的行。"
         "返回匹配行列表，含文件路径、行号、行内容。"
