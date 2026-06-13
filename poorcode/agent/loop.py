@@ -205,50 +205,82 @@ class AgentLoop:
         history: list[Message],
         results: list[tuple[ToolCallRequest, ToolResult]],
     ) -> None:
-        """将工具调用和结果追加到对话历史."""
+        """将工具调用和结果追加到对话历史.
+
+        同一轮 LLM 响应的多个工具调用合并为一条 assistant 消息，
+        多个工具结果合并为一条 user（Anthropic）或多条 tool（OpenAI）消息.
+        """
         provider_type = type(self._provider).__name__
 
-        for call, result in results:
-            if provider_type == "AnthropicProvider":
-                from poorcode.provider.anthropic import AnthropicProvider
+        if not results:
+            return
 
-                history.append(
-                    AnthropicProvider.build_tool_use_message(
-                        call.tool_use_id, call.tool_name, call.tool_input
-                    )
-                )
-                history.append(
-                    AnthropicProvider.build_tool_result_message(
-                        call.tool_use_id, result
-                    )
-                )
-            elif provider_type == "OpenAIProvider":
-                from poorcode.provider.openai import OpenAIProvider
+        if provider_type == "AnthropicProvider":
+            # 合并所有 tool_use 到一个 assistant content block 列表
+            tool_use_blocks: list[dict] = []
+            for call, _ in results:
+                tool_use_blocks.append({
+                    "type": "tool_use",
+                    "id": call.tool_use_id,
+                    "name": call.tool_name,
+                    "input": call.tool_input,
+                })
+            history.append(Message(role="assistant", content=tool_use_blocks))
 
-                history.append(
-                    OpenAIProvider.build_tool_use_message(
-                        call.tool_use_id, call.tool_name, call.tool_input
-                    )
-                )
-                history.append(
-                    OpenAIProvider.build_tool_result_message(
-                        call.tool_use_id, result
-                    )
-                )
-            else:
-                # 回退：纯文本追加
-                history.append(
-                    Message(
-                        role="assistant",
-                        content=f"[调用工具 {call.tool_name}]",
-                    )
-                )
-                history.append(
-                    Message(
-                        role="user",
-                        content=f"工具 {call.tool_name} 结果：{result.content}",
-                    )
-                )
+            # 合并所有 tool_result 到一个 user content block 列表
+            tool_result_blocks: list[dict] = []
+            for call, result in results:
+                content = result.content
+                if not result.success and result.error:
+                    content = f"[{result.error}] {content}"
+                tool_result_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": call.tool_use_id,
+                    "content": content,
+                })
+            history.append(Message(role="user", content=tool_result_blocks))
+
+        elif provider_type == "OpenAIProvider":
+            import json
+
+            # 合并所有 tool_calls 到一个 assistant 消息
+            tool_calls_list: list[dict] = []
+            for call, _ in results:
+                tool_calls_list.append({
+                    "id": call.tool_use_id,
+                    "type": "function",
+                    "function": {
+                        "name": call.tool_name,
+                        "arguments": json.dumps(call.tool_input, ensure_ascii=False),
+                    },
+                })
+            history.append(Message(
+                role="assistant",
+                content={"tool_calls": tool_calls_list},
+            ))
+
+            # 每个 tool_result 单独一条 tool 消息
+            for call, result in results:
+                content = result.content
+                if not result.success and result.error:
+                    content = f"[{result.error}] {content}"
+                history.append(Message(
+                    role="tool",
+                    content=content,
+                    tool_call_id=call.tool_use_id,
+                ))
+
+        else:
+            # 回退：纯文本追加
+            for call, result in results:
+                history.append(Message(
+                    role="assistant",
+                    content=f"[调用工具 {call.tool_name}]",
+                ))
+                history.append(Message(
+                    role="user",
+                    content=f"工具 {call.tool_name} 结果：{result.content}",
+                ))
 
 
 def _to_result_event(

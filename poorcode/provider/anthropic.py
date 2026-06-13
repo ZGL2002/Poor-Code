@@ -56,6 +56,9 @@ class AnthropicProvider(LLMProvider):
             "messages": messages,
             "stream": True,
             "max_tokens": 4096,
+            # 禁用 extended thinking：避免 DeepSeek 等兼容 API 要求
+            # 传回 thinking block 签名带来的 complexity
+            "thinking": {"type": "disabled"},
         }
         if system_prompt:
             body["system"] = system_prompt
