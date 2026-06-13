@@ -91,18 +91,20 @@ class AnthropicProvider(LLMProvider):
 
                 if block_type == "tool_use":
                     tool_use_count += 1
-                    in_tool_use = True
-                    current_tool_id = content_block.get("id", "")
-                    current_tool_name = content_block.get("name", "")
-                    current_tool_json = ""
 
-                    # 超过 1 个工具调用时报错
-                    if tool_use_count > 1:
+                    if tool_use_count == 1:
+                        # 第一个工具：记录信息并开始累积 JSON
+                        in_tool_use = True
+                        current_tool_id = content_block.get("id", "")
+                        current_tool_name = content_block.get("name", "")
+                        current_tool_json = ""
+                    else:
+                        # 第二个及以后的工具：忽略，不覆盖第一个工具的状态
                         yield StreamEvent(
                             type="tool_error",
                             content=(
                                 f"模型请求了 {tool_use_count} 个工具"
-                                f"（{current_tool_name} 等），"
+                                f"（{content_block.get('name', '')} 等），"
                                 f"本次仅支持 1 个。仅执行第 1 个。"
                             ),
                         )
@@ -127,7 +129,7 @@ class AnthropicProvider(LLMProvider):
                     current_tool_json += delta.get("partial_json", "")
 
             elif event_type == "content_block_stop":
-                if in_tool_use and current_tool_name and tool_use_count == 1:
+                if in_tool_use and current_tool_name and tool_use_count >= 1:
                     # 尝试解析累积的 JSON
                     try:
                         tool_input = json.loads(current_tool_json) if current_tool_json.strip() else {}
