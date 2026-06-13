@@ -123,11 +123,11 @@ class AgentLoop:
                 )
                 return
 
-            # 检查停止条件
+            # 检查停止条件（致命流错误已在上面 try/except 中处理，
+            # collector 的 error_message 记录的是可恢复的 tool 解析警告，不在此终止）
             stop_reason = stop_checker.check(
                 iteration=iteration,
                 tool_calls=collector.tool_calls,
-                stream_error=collector.error_message if collector.had_error else None,
             )
 
             if stop_reason == "natural_stop":

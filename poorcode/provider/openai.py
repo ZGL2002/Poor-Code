@@ -124,59 +124,32 @@ class OpenAIProvider(LLMProvider):
             # 流式结束或 tool_calls 完成
             if finish_reason:
                 if finish_reason == "tool_calls" and tool_calls_parts:
-                    # 检查多个工具调用
-                    if len(tool_calls_parts) > 1:
-                        # 只执行第一个，报错
-                        first_key = sorted(tool_calls_parts.keys())[0]
-                        first = tool_calls_parts[first_key]
+                    # 产出所有工具调用（Agent Loop 支持多工具并发/串行）
+                    for idx in sorted(tool_calls_parts.keys()):
+                        part = tool_calls_parts[idx]
                         try:
-                            tool_input = json.loads(first["arguments"]) if first["arguments"].strip() else {}
+                            tool_input = json.loads(part["arguments"]) if part["arguments"].strip() else {}
                         except json.JSONDecodeError:
-                            tool_input = {}
+                            yield StreamEvent(
+                                type="tool_error",
+                                content=(
+                                    f"工具参数 JSON 解析失败："
+                                    f"{part['arguments'][:200]}"
+                                ),
+                            )
+                            continue
                         request = ToolCallRequest(
-                            tool_name=first["name"],
+                            tool_name=part["name"],
                             tool_input=tool_input,
-                            tool_use_id=first["id"],
+                            tool_use_id=part["id"],
                         )
                         yield StreamEvent(type="tool_call", content=json.dumps({
                             "tool_name": request.tool_name,
                             "tool_input": request.tool_input,
                             "tool_use_id": request.tool_use_id,
                         }))
-                        yield StreamEvent(
-                            type="tool_error",
-                            content=(
-                                f"模型请求了 {len(tool_calls_parts)} 个工具，"
-                                f"本次仅支持 1 个。仅执行第 1 个。"
-                            ),
-                        )
-                    else:
-                        # 单个工具调用
-                        for idx in sorted(tool_calls_parts.keys()):
-                            part = tool_calls_parts[idx]
-                            try:
-                                tool_input = json.loads(part["arguments"]) if part["arguments"].strip() else {}
-                            except json.JSONDecodeError:
-                                yield StreamEvent(
-                                    type="tool_error",
-                                    content=(
-                                        f"工具参数 JSON 解析失败："
-                                        f"{part['arguments'][:200]}"
-                                    ),
-                                )
-                                continue
-                            request = ToolCallRequest(
-                                tool_name=part["name"],
-                                tool_input=tool_input,
-                                tool_use_id=part["id"],
-                            )
-                            yield StreamEvent(type="tool_call", content=json.dumps({
-                                "tool_name": request.tool_name,
-                                "tool_input": request.tool_input,
-                                "tool_use_id": request.tool_use_id,
-                            }))
 
-                    # tool_calls 完成后不 yield done（由 chat loop 二次调用后 yield）
+                    # tool_calls 完成后不 yield done（由 Agent Loop 继续循环）
                     return
 
                 # 普通文本结束

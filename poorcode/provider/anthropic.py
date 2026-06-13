@@ -91,23 +91,13 @@ class AnthropicProvider(LLMProvider):
 
                 if block_type == "tool_use":
                     tool_use_count += 1
-
-                    if tool_use_count == 1:
-                        # 第一个工具：记录信息并开始累积 JSON
-                        in_tool_use = True
-                        current_tool_id = content_block.get("id", "")
-                        current_tool_name = content_block.get("name", "")
-                        current_tool_json = ""
-                    else:
-                        # 第二个及以后的工具：忽略，不覆盖第一个工具的状态
-                        yield StreamEvent(
-                            type="tool_error",
-                            content=(
-                                f"模型请求了 {tool_use_count} 个工具"
-                                f"（{content_block.get('name', '')} 等），"
-                                f"本次仅支持 1 个。仅执行第 1 个。"
-                            ),
-                        )
+                    # 每个 tool_use block 都记录：Anthropic SSE 顺序发送，
+                    # 前一个 block 在 content_block_stop 已完成解析后
+                    # 才会发送下一个 content_block_start
+                    in_tool_use = True
+                    current_tool_id = content_block.get("id", "")
+                    current_tool_name = content_block.get("name", "")
+                    current_tool_json = ""
                 else:
                     in_tool_use = False
                 continue
